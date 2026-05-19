@@ -5,21 +5,32 @@ import time
 from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
 
+from src.common.auth import AuthorizationService, OperatorPrincipal
+
 
 class AgentExecutor:
     def __init__(self, max_concurrent: int = 5):
         self.max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_tasks: Dict[str, asyncio.Task] = {}
+        self._execution_workspaces: Dict[str, str] = {}
         self._results: Dict[str, Any] = {}
 
-    async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
+    async def execute(
+        self,
+        agent_id: str,
+        task: Dict[str, Any],
+        handler: Callable,
+        *,
+        workspace_id: Optional[str] = None,
+    ) -> str:
         execution_id = str(uuid4())
         async with self._semaphore:
             task_obj = asyncio.create_task(
                 self._run_execution(execution_id, agent_id, task, handler)
             )
             self._active_tasks[execution_id] = task_obj
+            self._execution_workspaces[execution_id] = workspace_id or task.get("workspace_id") or agent_id
             try:
                 result = await task_obj
                 self._results[execution_id] = result
@@ -27,6 +38,7 @@ class AgentExecutor:
                 self._results[execution_id] = {"error": str(e)}
             finally:
                 self._active_tasks.pop(execution_id, None)
+                self._execution_workspaces.pop(execution_id, None)
         return execution_id
 
     async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
@@ -45,7 +57,25 @@ class AgentExecutor:
     def get_result(self, execution_id: str) -> Optional[Any]:
         return self._results.get(execution_id)
 
-    def cancel(self, execution_id: str) -> bool:
+    def active_execution_ids(self) -> tuple[str, ...]:
+        return tuple(self._active_tasks.keys())
+
+    def cancel(
+        self,
+        execution_id: str,
+        *,
+        principal: Optional[OperatorPrincipal] = None,
+        authorizer: Optional[AuthorizationService] = None,
+    ) -> bool:
+        workspace_id = self._execution_workspaces.get(execution_id)
+        if workspace_id is None:
+            return False
+
+        (authorizer or AuthorizationService()).require_run_cancellation(
+            principal,
+            workspace_id=workspace_id,
+        )
+
         task = self._active_tasks.get(execution_id)
         if task and not task.done():
             task.cancel()
