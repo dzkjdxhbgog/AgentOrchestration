@@ -1,6 +1,7 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
 import json
+import re
 import time
 import uuid
 from enum import Enum
@@ -17,12 +18,16 @@ class AgentStatus(Enum):
 
 
 class AgentRegistry:
+    _AGENT_TYPE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$")
+
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._audit_log: List[Dict[str, Any]] = []
 
     def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+        self._validate_agent_type(agent_type)
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -41,6 +46,26 @@ class AgentRegistry:
             self._index[group] = []
         self._index[group].append(agent_id)
         return agent_id
+
+    def _validate_agent_type(self, agent_type: str) -> None:
+        if not isinstance(agent_type, str) or not self._AGENT_TYPE_PATTERN.fullmatch(agent_type):
+            self._record_audit_event("registration_rejected", "invalid_agent_type")
+            raise ValueError(
+                "Invalid agent type: use dotted handler segments containing only "
+                "letters, numbers, underscores, or hyphens"
+            )
+
+    def _record_audit_event(self, action: str, reason: str) -> None:
+        self._audit_log.append(
+            {
+                "action": action,
+                "reason": reason,
+                "timestamp": time.time(),
+            }
+        )
+
+    def audit_events(self) -> List[Dict[str, Any]]:
+        return list(self._audit_log)
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)

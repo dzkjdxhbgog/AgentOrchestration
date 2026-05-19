@@ -11,6 +11,25 @@ class TestAgentRegistry:
         assert agent_id is not None
         assert self.registry.count() == 1
 
+    @pytest.mark.parametrize(
+        "agent_type",
+        [
+            "../worker.processor",
+            "..\\worker.processor",
+            "/worker/processor",
+            "worker/../../processor",
+            "worker..processor",
+            ".worker.processor",
+        ],
+    )
+    def test_register_rejects_path_traversal_agent_type(self, agent_type):
+        with pytest.raises(ValueError, match="Invalid agent type"):
+            self.registry.register("test-agent", agent_type)
+
+        assert self.registry.count() == 0
+        assert self.registry.list() == []
+        assert self.registry.audit_events()[-1]["reason"] == "invalid_agent_type"
+
     def test_get_agent(self):
         agent_id = self.registry.register("test-agent", "worker.processor")
         agent = self.registry.get(agent_id)
