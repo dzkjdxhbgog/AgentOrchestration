@@ -30,6 +30,9 @@ class TestMetricsCollector:
         time.sleep(0.01)
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
+        snapshot = self.metrics.snapshot()
+        assert snapshot["histograms"]["operation"]["count"] == 1
+        assert snapshot["histograms"]["operation"]["sum"] == duration
 
 # 2019-07-16T09:29:21 update
 
