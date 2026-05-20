@@ -1,11 +1,25 @@
 """Agent lifecycle management module."""
 
-from .registry import AgentRegistry
+from .registry import AgentRegistry, AgentStatus
 from .executor import AgentExecutor
 from .runtime import AgentRuntime
-from .sandbox import AgentSandbox
 
-__all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
+
+def __getattr__(name):
+    if name == "AgentSandbox":
+        from .sandbox import AgentSandbox
+
+        return AgentSandbox
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [
+    "AgentRegistry",
+    "AgentStatus",
+    "AgentExecutor",
+    "AgentRuntime",
+    "AgentSandbox",
+]
 
 # 2019-02-05T12:34:30 update
 
