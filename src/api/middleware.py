@@ -2,7 +2,8 @@
 
 import time
 import logging
-from typing import Callable
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Iterable, Optional, Set
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -10,13 +11,126 @@ from starlette.responses import Response
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class CredentialRecord:
+    subject: str
+    scopes: Set[str] = field(default_factory=set)
+    workspace_role: Optional[str] = None
+    expires_at: Optional[float] = None
+    revoked: bool = False
+    disabled: bool = False
+    client_type: str = "token"
+
+
+@dataclass
+class Principal:
+    subject: str
+    scopes: Set[str]
+    workspace_role: Optional[str]
+    client_type: str
+
+
+class PermissionService:
+    def __init__(self, allow_legacy_bearer: bool = True):
+        self.allow_legacy_bearer = allow_legacy_bearer
+        self._credentials: Dict[str, CredentialRecord] = {}
+
+    def register_credential(
+        self,
+        token: str,
+        subject: str,
+        scopes: Iterable[str] = (),
+        workspace_role: Optional[str] = None,
+        expires_at: Optional[float] = None,
+        revoked: bool = False,
+        disabled: bool = False,
+        client_type: str = "token",
+    ) -> None:
+        self._credentials[token] = CredentialRecord(
+            subject=subject,
+            scopes=set(scopes),
+            workspace_role=workspace_role,
+            expires_at=expires_at,
+            revoked=revoked,
+            disabled=disabled,
+            client_type=client_type,
+        )
+
+    def revoke_credential(self, token: str) -> None:
+        if token in self._credentials:
+            self._credentials[token].revoked = True
+
+    def authenticate(self, request: Request) -> tuple[Optional[Principal], int]:
+        token, client_type = self._extract_token(request)
+        if not token:
+            return None, 401
+
+        record = self._credentials.get(token)
+        if record is None:
+            if self.allow_legacy_bearer and client_type == "token":
+                return Principal("legacy-token", {"*"}, "admin", "token"), 200
+            return None, 401
+
+        if record.client_type != client_type:
+            return None, 401
+        if record.revoked or record.disabled:
+            return None, 401
+        if record.expires_at is not None and record.expires_at <= time.time():
+            return None, 401
+
+        return Principal(record.subject, set(record.scopes), record.workspace_role, record.client_type), 200
+
+    def authorize(
+        self,
+        request: Request,
+        required_scopes: Iterable[str] = (),
+        required_roles: Iterable[str] = (),
+    ) -> tuple[Optional[Principal], int]:
+        principal, status_code = self.authenticate(request)
+        if principal is None:
+            return None, status_code
+
+        scopes = set(required_scopes)
+        roles = set(required_roles)
+        if scopes and "*" not in principal.scopes and not scopes.issubset(principal.scopes):
+            return None, 403
+        if roles and principal.workspace_role not in roles:
+            return None, 403
+        return principal, 200
+
+    def _extract_token(self, request: Request) -> tuple[Optional[str], Optional[str]]:
+        authorization = request.headers.get("Authorization", "")
+        if authorization.startswith("Bearer "):
+            return authorization.removeprefix("Bearer ").strip(), "token"
+
+        session_token = request.cookies.get("ao_session") or request.headers.get("X-Session-Token")
+        if session_token:
+            return session_token, "browser"
+        return None, None
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
+    TASK_MONITOR_SCOPES = {"task_monitor:read"}
+    TASK_MONITOR_ROLES = {"owner", "admin", "operator"}
+
+    def __init__(self, app, permission_service: Optional[PermissionService] = None):
+        super().__init__(app)
+        self.permission_service = permission_service or PermissionService()
+
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
+            scopes = self.TASK_MONITOR_SCOPES if self._is_task_monitor_request(request) else ()
+            roles = self.TASK_MONITOR_ROLES if self._is_task_monitor_request(request) else ()
+            principal, status_code = self.permission_service.authorize(request, scopes, roles)
+            if principal is None:
+                content = "Forbidden" if status_code == 403 else "Unauthorized"
+                return Response(status_code=status_code, content=content)
+            request.state.principal = principal
         return await call_next(request)
+
+    def _is_task_monitor_request(self, request: Request) -> bool:
+        path = request.url.path.lower()
+        return "task-monitor" in path or "task_monitor" in path or path.endswith("/monitor/poll")
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
