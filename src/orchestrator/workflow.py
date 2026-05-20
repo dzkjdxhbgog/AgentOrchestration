@@ -1,8 +1,17 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
+from collections.abc import Sequence
 from enum import Enum
+from math import prod
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+from src.common.metrics import metrics
+
+
+logger = logging.getLogger(__name__)
+DEFAULT_MAX_MATRIX_EXPANSION = 256
 
 
 class StepStatus(Enum):
@@ -13,13 +22,27 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class MatrixExpansionError(ValueError):
+    """Raised when a workflow step would violate matrix fan-out policy."""
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        matrix: Optional[Dict[str, Sequence[Any]]] = None,
+        max_matrix_expansion: int = DEFAULT_MAX_MATRIX_EXPANSION,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.matrix = matrix or {}
+        self.max_matrix_expansion = max_matrix_expansion
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
@@ -33,14 +56,66 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.audit_records: List[Dict[str, Any]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        self.validate_matrix_expansion(step)
         self.steps.append(step)
         self._step_map[step.id] = step
         return self
 
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
+
+    def validate_matrix_expansion(self, step: WorkflowStep) -> int:
+        """Validate dynamic fan-out before a step is registered or dispatched."""
+        if not step.matrix:
+            return 1
+
+        invalid_dimensions = [
+            name for name, values in step.matrix.items()
+            if not isinstance(values, Sequence) or isinstance(values, (str, bytes)) or not values
+        ]
+        if invalid_dimensions:
+            self._reject_matrix(step, "invalid_dimension", invalid_dimensions)
+
+        duplicate_dimensions = []
+        for name, values in step.matrix.items():
+            seen = set()
+            for value in values:
+                marker = repr(value)
+                if marker in seen:
+                    duplicate_dimensions.append(name)
+                    break
+                seen.add(marker)
+        if duplicate_dimensions:
+            self._reject_matrix(step, "duplicate_dimension_values", duplicate_dimensions)
+
+        expansion_count = prod(len(values) for values in step.matrix.values())
+        if expansion_count > step.max_matrix_expansion:
+            self._reject_matrix(step, "expansion_limit_exceeded", list(step.matrix))
+
+        metrics.gauge("workflow.matrix_expansion.size", float(expansion_count))
+        return expansion_count
+
+    def _reject_matrix(self, step: WorkflowStep, reason: str, dimensions: List[str]) -> None:
+        metrics.increment("workflow.matrix_expansion.rejected")
+        record = {
+            "event": "workflow.matrix_expansion.rejected",
+            "reason": reason,
+            "workflow_id": self.id,
+            "step_id": step.id,
+            "step_name": step.name,
+            "dimensions": dimensions,
+        }
+        self.audit_records.append(record)
+        logger.warning(
+            "Rejected workflow matrix expansion for step %s: %s",
+            step.name,
+            reason,
+            extra={"workflow_id": self.id, "step_id": step.id},
+        )
+        raise MatrixExpansionError(reason)
 
 
 class WorkflowManager:
@@ -64,6 +139,12 @@ class WorkflowManager:
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
+            return False
+
+        try:
+            for step in workflow.steps:
+                workflow.validate_matrix_expansion(step)
+        except MatrixExpansionError:
             return False
 
         workflow.status = StepStatus.RUNNING
