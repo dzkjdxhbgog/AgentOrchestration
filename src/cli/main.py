@@ -1,10 +1,35 @@
 """CLI entry point for the agent orchestrator."""
 
 import argparse
+from pathlib import Path
 import sys
 
-from src.common.config import Config
+import yaml
+
 from src.common.logging import configure_logging
+
+
+def _validate_manifest(manifest_path: str) -> Path:
+    path = Path(manifest_path)
+    if not path.is_file():
+        raise ValueError(f"manifest does not exist: {manifest_path}")
+
+    try:
+        with path.open("r", encoding="utf-8") as manifest_file:
+            manifest = yaml.safe_load(manifest_file)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"manifest is not valid YAML: {exc}") from exc
+
+    if manifest is None:
+        raise ValueError("manifest is empty")
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be a YAML mapping")
+
+    return path
+
+
+def _deploy_agent(manifest_path: Path) -> None:
+    print(f"Deploying agent from manifest: {manifest_path}")
 
 
 def cli():
@@ -19,6 +44,11 @@ def cli():
 
     deploy_parser = subparsers.add_parser("deploy", help="Deploy an agent")
     deploy_parser.add_argument("manifest", help="Path to agent manifest file")
+    deploy_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate the manifest without deploying an agent",
+    )
 
     status_parser = subparsers.add_parser("status", help="Show agent status")
     status_parser.add_argument("--watch", "-w", action="store_true", help="Watch mode")
@@ -37,7 +67,16 @@ def cli():
     if args.command == "init":
         print(f"Initializing project: {args.name}")
     elif args.command == "deploy":
-        print(f"Deploying agent from manifest: {args.manifest}")
+        try:
+            manifest_path = _validate_manifest(args.manifest)
+        except ValueError as exc:
+            print(f"Deploy validation failed: {exc}", file=sys.stderr)
+            sys.exit(2)
+
+        if args.dry_run:
+            print(f"Dry run passed for manifest: {manifest_path}")
+        else:
+            _deploy_agent(manifest_path)
     elif args.command == "status":
         print("Checking agent status...")
     elif args.command == "logs":
