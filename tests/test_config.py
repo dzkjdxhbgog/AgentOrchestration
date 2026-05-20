@@ -1,5 +1,6 @@
 import pytest
 from src.common.config import Config
+from src.common.errors import ConfigurationError
 
 
 class TestConfig:
@@ -9,6 +10,17 @@ class TestConfig:
         config = Config(str(config_file))
         assert config.get("app.name") == "test"
         assert config.get("app.port") == 8080
+
+    def test_load_rejects_config_file_over_max_size(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Config, "MAX_CONFIG_FILE_SIZE_BYTES", 32)
+        config_file = tmp_path / "oversized.json"
+        config_file.write_text('{"app": {"name": "' + "x" * 64 + '"}}')
+
+        config = Config()
+        with pytest.raises(ConfigurationError, match="exceeds maximum size of 32 bytes"):
+            config.load(str(config_file))
+
+        assert config.to_dict() == {}
 
     def test_default_value(self):
         config = Config()
