@@ -36,6 +36,44 @@ class TestTaskScheduler:
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
 
+    def test_scheduled_task_preserves_identity(self):
+        task_id = self.scheduler.schedule({"type": "test"}, delay=0)
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task["id"] == task_id
+        assert task["retries"] == 0
+
+    def test_retry_acknowledgement_is_idempotent(self):
+        self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"])
+        assert self.scheduler.fail(task["id"])
+
+        retried = asyncio.run(self.scheduler.dequeue())
+        assert retried["id"] == task["id"]
+        assert retried["retries"] == 1
+        assert asyncio.run(self.scheduler.dequeue(timeout=0)) is None
+        assert any(record["event"] == "retry_ack_duplicate_deferred"
+                   for record in self.scheduler.audit_records())
+
+    def test_dead_letter_acknowledgement_is_idempotent(self):
+        self.scheduler._max_retries = 1
+        self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert not self.scheduler.fail(task["id"])
+        assert self.scheduler.fail(task["id"])
+
+        dead_letters = self.scheduler.dead_letters()
+        assert list(dead_letters) == [task["id"]]
+        assert dead_letters[task["id"]]["retries"] == 1
+        assert len(self.scheduler.dead_letters()) == 1
+        assert any(record["event"] == "dead_letter_ack_duplicate_ignored"
+                   for record in self.scheduler.audit_records())
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update
