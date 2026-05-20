@@ -3,7 +3,7 @@
 import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 from uuid import uuid4
 
 
@@ -35,17 +35,29 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._worker_capabilities: Dict[str, Dict] = {}
+        self._audit_log: List[Dict] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+        required_capabilities: Optional[Iterable[str]] = None,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
         task["retries"] = 0
+        task["queue"] = queue
+        task["priority"] = priority
+        if required_capabilities is not None:
+            task["required_capabilities"] = sorted(
+                self._normalize_capabilities(required_capabilities)
+            )
 
-        if queue not in self._queues:
-            self._queues[queue] = PriorityQueue()
-        self._queues[queue].push(task, priority)
+        self._push_existing(task, queue, priority)
         return task_id
 
     def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
@@ -54,7 +66,28 @@ class TaskScheduler:
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+        worker_id: Optional[str] = None,
+        worker_capabilities: Optional[Iterable[str]] = None,
+        reconnect_id: Optional[str] = None,
+    ) -> Optional[Dict]:
+        if worker_id and worker_capabilities is not None:
+            normalized = self._normalize_capabilities(worker_capabilities)
+            current = self._worker_capabilities.get(worker_id)
+            if (
+                reconnect_id
+                or not current
+                or current["capabilities"] != normalized
+            ):
+                self.refresh_worker_capabilities(
+                    worker_id,
+                    normalized,
+                    reconnect_id=reconnect_id,
+                )
+
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -65,21 +98,195 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                if worker_id and not self._worker_can_run(worker_id, task):
+                    self._clear_claim(task)
+                    self._push_existing(task, queue, task.get("priority", 0))
+                    self._audit(
+                        "defer_capability_mismatch",
+                        task_id=task["id"],
+                        worker_id=worker_id,
+                    )
+                    return None
+                if worker_id:
+                    worker = self._worker_capabilities[worker_id]
+                    task["claimed_by"] = worker_id
+                    task["worker_capability_version"] = worker["version"]
+                    task["claim_id"] = str(uuid4())
+                    self._audit(
+                        "claim",
+                        task_id=task["id"],
+                        worker_id=worker_id,
+                        version=worker["version"],
+                    )
                 self._in_flight[task["id"]] = task
                 return task
         return None
 
-    def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+    def complete(
+        self,
+        task_id: str,
+        worker_id: Optional[str] = None,
+        capability_version: Optional[int] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
+        if not task:
+            return False
+        if not self._claim_matches(task, worker_id, capability_version):
+            self._audit(
+                "reject_stale_ack",
+                task_id=task_id,
+                worker_id=worker_id,
+                version=capability_version,
+            )
+            return False
+        self._in_flight.pop(task_id, None)
+        self._audit("complete", task_id=task_id, worker_id=worker_id)
+        return True
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        worker_id: Optional[str] = None,
+        capability_version: Optional[int] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
+        if task and not self._claim_matches(
+            task,
+            worker_id,
+            capability_version,
+        ):
+            self._audit(
+                "reject_stale_nack",
+                task_id=task_id,
+                worker_id=worker_id,
+                version=capability_version,
+            )
+            return False
         task = self._in_flight.pop(task_id, None)
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                self._clear_claim(task)
+                self._push_existing(
+                    task,
+                    queue,
+                    priority=task.get("priority", 0),
+                )
+                self._audit("retry", task_id=task_id, worker_id=worker_id)
                 return True
         return False
+
+    def refresh_worker_capabilities(
+        self,
+        worker_id: str,
+        capabilities: Iterable[str],
+        reconnect_id: Optional[str] = None,
+    ) -> int:
+        previous = self._worker_capabilities.get(worker_id, {})
+        version = previous.get("version", 0) + 1
+        normalized = self._normalize_capabilities(capabilities)
+        self._worker_capabilities[worker_id] = {
+            "capabilities": normalized,
+            "version": version,
+            "reconnect_id": reconnect_id,
+            "updated_at": time.time(),
+        }
+        self._audit(
+            "refresh_worker_capabilities",
+            worker_id=worker_id,
+            version=version,
+            reconnect_id=reconnect_id,
+        )
+        self._defer_worker_claims(worker_id)
+        return version
+
+    @property
+    def audit_log(self) -> List[Dict]:
+        return list(self._audit_log)
+
+    def _push_existing(
+        self,
+        task: Dict,
+        queue: str,
+        priority: int = 0,
+    ) -> None:
+        task["queue"] = queue
+        task["priority"] = priority
+        if queue not in self._queues:
+            self._queues[queue] = PriorityQueue()
+        self._queues[queue].push(task, priority)
+
+    def _defer_worker_claims(self, worker_id: str) -> None:
+        for task_id, task in list(self._in_flight.items()):
+            if task.get("claimed_by") != worker_id:
+                continue
+            self._in_flight.pop(task_id, None)
+            self._clear_claim(task)
+            self._push_existing(
+                task,
+                task.get("queue", "default"),
+                priority=task.get("priority", 0),
+            )
+            self._audit(
+                "defer_reconnected_worker_claim",
+                task_id=task_id,
+                worker_id=worker_id,
+            )
+
+    def _worker_can_run(self, worker_id: str, task: Dict) -> bool:
+        worker = self._worker_capabilities.get(worker_id)
+        if not worker:
+            return False
+        return self._required_capabilities(task).issubset(
+            worker["capabilities"]
+        )
+
+    def _claim_matches(
+        self,
+        task: Dict,
+        worker_id: Optional[str],
+        capability_version: Optional[int],
+    ) -> bool:
+        if worker_id is not None and task.get("claimed_by") != worker_id:
+            return False
+        if (
+            capability_version is not None
+            and task.get("worker_capability_version") != capability_version
+        ):
+            return False
+        current = self._worker_capabilities.get(task.get("claimed_by"))
+        if (
+            current
+            and task.get("worker_capability_version") != current["version"]
+        ):
+            return False
+        return True
+
+    def _required_capabilities(self, task: Dict) -> Set[str]:
+        return self._normalize_capabilities(
+            task.get("required_capabilities", [])
+        )
+
+    def _normalize_capabilities(self, capabilities: Iterable[str]) -> Set[str]:
+        normalized = set()
+        for capability in capabilities:
+            capability = str(capability).strip().lower()
+            if capability:
+                normalized.add(capability)
+        return normalized
+
+    def _clear_claim(self, task: Dict) -> None:
+        task.pop("claimed_by", None)
+        task.pop("worker_capability_version", None)
+        task.pop("claim_id", None)
+
+    def _audit(self, event: str, **fields: Any) -> None:
+        record = {"event": event, "timestamp": time.time()}
+        record.update(
+            {key: value for key, value in fields.items() if value is not None}
+        )
+        self._audit_log.append(record)
 
 # 2019-04-25T08:37:12 update
 

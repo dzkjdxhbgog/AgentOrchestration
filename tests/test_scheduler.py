@@ -36,6 +36,85 @@ class TestTaskScheduler:
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
 
+    def test_worker_reconnect_claims_with_refreshed_capabilities(self):
+        self.scheduler.enqueue(
+            {"type": "build"},
+            required_capabilities=["python"],
+        )
+
+        import asyncio
+        task = asyncio.run(
+            self.scheduler.dequeue(
+                worker_id="worker-1",
+                worker_capabilities=["python", "linux"],
+                reconnect_id="connect-1",
+            )
+        )
+
+        assert task is not None
+        assert task["claimed_by"] == "worker-1"
+        assert task["worker_capability_version"] == 1
+        assert any(
+            event["event"] == "refresh_worker_capabilities"
+            for event in self.scheduler.audit_log
+        )
+
+    def test_worker_without_capability_defers_task_without_losing_it(self):
+        self.scheduler.enqueue(
+            {"type": "gpu-build"},
+            required_capabilities=["gpu"],
+        )
+
+        import asyncio
+        task = asyncio.run(
+            self.scheduler.dequeue(
+                worker_id="worker-1",
+                worker_capabilities=["python"],
+                reconnect_id="connect-1",
+            )
+        )
+
+        assert task is None
+        assert self.scheduler._queues["default"].peek()["type"] == "gpu-build"
+        assert any(
+            event["event"] == "defer_capability_mismatch"
+            for event in self.scheduler.audit_log
+        )
+
+    def test_reconnect_requeues_claim_and_rejects_stale_ack(self):
+        task_id = self.scheduler.enqueue(
+            {"type": "build"},
+            required_capabilities=["python"],
+        )
+
+        import asyncio
+        task = asyncio.run(
+            self.scheduler.dequeue(
+                worker_id="worker-1",
+                worker_capabilities=["python"],
+                reconnect_id="connect-1",
+            )
+        )
+        stale_version = task["worker_capability_version"]
+
+        self.scheduler.refresh_worker_capabilities(
+            "worker-1",
+            ["shell"],
+            reconnect_id="connect-2",
+        )
+
+        assert task_id not in self.scheduler._in_flight
+        assert self.scheduler._queues["default"].peek()["id"] == task_id
+        assert not self.scheduler.complete(
+            task_id,
+            worker_id="worker-1",
+            capability_version=stale_version,
+        )
+        assert any(
+            event["event"] == "defer_reconnected_worker_claim"
+            for event in self.scheduler.audit_log
+        )
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update
