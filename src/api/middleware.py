@@ -1,8 +1,9 @@
 """API middleware components."""
 
-import time
 import logging
-from typing import Callable
+import math
+import time
+from typing import Callable, List, Tuple
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -19,36 +20,87 @@ class AuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-class RateLimitMiddleware(BaseHTTPMiddleware):
+class RateLimitMiddleware:
+    _STATE_KEY = "_rate_limit"
+
     def __init__(self, app, max_requests: int = 100, window: int = 60):
-        super().__init__(app)
+        self.app = app
         self.max_requests = max_requests
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        client_ip = request.client.host if request.client else "unknown"
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
         now = time.time()
+        client_ip = self._client_ip(scope)
+        requests = self._requests.setdefault(client_ip, [])
+        requests[:] = [t for t in requests if now - t < self.window]
+        state = scope.setdefault("state", {})
+        state[self._STATE_KEY] = {"client": client_ip}
 
-        if client_ip not in self._requests:
-            self._requests[client_ip] = []
+        try:
+            if len(requests) >= self.max_requests:
+                await self._send_rejection(send, self._reset_after(requests, now))
+                return
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+            requests.append(now)
+            remaining = max(self.max_requests - len(requests), 0)
 
-        if len(self._requests[client_ip]) >= self.max_requests:
-            return Response(status_code=429, content="Too many requests")
+            async def send_with_rate_headers(message) -> None:
+                if message["type"] == "http.response.start":
+                    headers = list(message.get("headers") or [])
+                    headers.extend(self._raw_headers(remaining, self._reset_after(requests, time.time())))
+                    message = {**message, "headers": headers}
+                await send(message)
 
-        self._requests[client_ip].append(now)
-        return await call_next(request)
+            await self.app(scope, receive, send_with_rate_headers)
+        finally:
+            state.pop(self._STATE_KEY, None)
+
+    def _client_ip(self, scope) -> str:
+        client = scope.get("client")
+        return client[0] if client else "unknown"
+
+    def _reset_after(self, requests: List[float], now: float) -> int:
+        if not requests:
+            return self.window
+        return max(0, math.ceil(self.window - (now - requests[0])))
+
+    def _raw_headers(self, remaining: int, reset_after: int) -> List[Tuple[bytes, bytes]]:
+        return [
+            (b"x-ratelimit-limit", str(self.max_requests).encode()),
+            (b"x-ratelimit-remaining", str(remaining).encode()),
+            (b"x-ratelimit-reset", str(reset_after).encode()),
+        ]
+
+    async def _send_rejection(self, send, reset_after: int) -> None:
+        headers = [
+            (b"content-type", b"text/plain; charset=utf-8"),
+            (b"retry-after", str(reset_after).encode()),
+            *self._raw_headers(0, reset_after),
+        ]
+        await send({"type": "http.response.start", "status": 429, "headers": headers})
+        await send({"type": "http.response.body", "body": b"Too many requests"})
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         start = time.time()
-        response = await call_next(request)
-        duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
-        return response
+        response = None
+        try:
+            response = await call_next(request)
+            return response
+        except Exception:
+            duration = time.time() - start
+            logger.exception(f"{request.method} {request.url.path} failed {duration:.3f}s")
+            raise
+        finally:
+            if response is not None:
+                duration = time.time() - start
+                logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
 
 # 2019-03-01T18:35:19 update
 

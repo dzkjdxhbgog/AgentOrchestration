@@ -2,7 +2,10 @@
 
 import os
 import tempfile
-import resource
+try:
+    import resource
+except ImportError:  # pragma: no cover - resource is Unix-only
+    resource = None
 from typing import Dict, Optional
 from pathlib import Path
 
@@ -37,6 +40,8 @@ class AgentSandbox:
         return self._sandboxes.get(agent_id)
 
     def apply_limits(self, agent_id: str, limits: ResourceLimits) -> None:
+        if resource is None:
+            return
         try:
             resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
             mem_bytes = limits.memory_mb * 1024 * 1024
