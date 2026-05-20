@@ -62,12 +62,24 @@ class OrchestrationEngine:
             )
             self.registry.update_status(agent_id, AgentStatus.PAUSED)
 
+            if not self.scheduler.complete(task_id, result=result):
+                logger.warning(f"Task {task_id} was already finalized; skipping completion hooks")
+                return
+
             for hook in self._hooks["post_execute"]:
+                await hook(task, result)
+            for hook in self._hooks["on_complete"]:
                 await hook(task, result)
 
             logger.info(f"Task {task_id} completed successfully")
 
+        except asyncio.CancelledError as e:
+            self.scheduler.fail(task_id, error=e)
+            for hook in self._hooks["on_error"]:
+                await hook(task, e)
+            raise
         except Exception as e:
+            self.scheduler.fail(task_id, error=e)
             logger.error(f"Task {task_id} failed: {e}")
             for hook in self._hooks["on_error"]:
                 await hook(task, e)

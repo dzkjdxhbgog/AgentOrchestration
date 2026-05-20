@@ -1,4 +1,6 @@
-import pytest
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +14,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +21,67 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_complete_records_terminal_outcome_and_clears_in_flight(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.complete(task["id"], result={"ok": True})
+
+        outcome = self.scheduler.get_terminal_outcome(task_id)
+        assert outcome["state"] == "completed"
+        assert outcome["result"] == {"ok": True}
+        assert self.scheduler.get_state(task_id) == "completed"
+        assert not self.scheduler.is_in_flight(task_id)
+
+    def test_complete_is_idempotent_under_concurrent_calls(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        asyncio.run(self.scheduler.dequeue())
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(
+                pool.map(
+                    lambda _: self.scheduler.complete(task_id, result={"ok": True}),
+                    range(8),
+                )
+            )
+
+        assert results.count(True) == 1
+        assert results.count(False) == 7
+        assert self.scheduler.get_terminal_outcome(task_id)["state"] == "completed"
+        assert not self.scheduler.is_in_flight(task_id)
+
+    def test_fail_retries_same_task_id_until_terminal_failure(self):
+        scheduler = TaskScheduler(max_retries=2)
+        task_id = scheduler.enqueue({"type": "test"})
+        task = asyncio.run(scheduler.dequeue())
+
+        assert scheduler.fail(task["id"], error=RuntimeError("first failure"))
+        assert scheduler.get_terminal_outcome(task_id) is None
+        assert scheduler.get_state(task_id) == "queued"
+
+        retry = asyncio.run(scheduler.dequeue())
+        assert retry["id"] == task_id
+        assert retry["retries"] == 1
+
+        assert scheduler.fail(task_id, error=RuntimeError("second failure"))
+        outcome = scheduler.get_terminal_outcome(task_id)
+        assert outcome["state"] == "failed"
+        assert outcome["retries"] == 2
+        assert scheduler.get_state(task_id) == "failed"
+        assert not scheduler.is_in_flight(task_id)
 
 # 2019-01-09T19:07:03 update
 
