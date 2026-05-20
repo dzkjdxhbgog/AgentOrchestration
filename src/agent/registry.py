@@ -13,6 +13,7 @@ class AgentStatus(Enum):
     PAUSED = "paused"
     STOPPED = "stopped"
     FAILED = "failed"
+    DISABLED = "disabled"
     TERMINATED = "terminated"
 
 
@@ -21,6 +22,26 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._list_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._audit_events: List[Dict[str, Any]] = []
+
+    def _record_audit(self, event: str, **metadata: Any) -> None:
+        self._audit_events.append(
+            {
+                "event": event,
+                "timestamp": time.time(),
+                "metadata": metadata,
+            }
+        )
+
+    def _invalidate_list_cache(self, reason: str, agent_id: Optional[str] = None) -> None:
+        if self._list_cache:
+            self._record_audit(
+                "registry_listing_cache_invalidated",
+                reason=reason,
+                agent_id=agent_id,
+            )
+        self._list_cache.clear()
 
     def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
         agent_id = str(uuid.uuid4())
@@ -40,25 +61,67 @@ class AgentRegistry:
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+        self._invalidate_list_cache("agent_registered", agent_id)
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
-        agents = self._agents.values()
+    def resolve(self, agent_id: str) -> Optional[Dict[str, Any]]:
+        agent = self._agents.get(agent_id)
+        if not agent:
+            return None
+        if agent["status"] == AgentStatus.DISABLED.value:
+            self._record_audit("disabled_agent_resolution_deferred", agent_id=agent_id)
+            return None
+        return agent
+
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+        include_disabled: bool = False,
+    ) -> List[Dict[str, Any]]:
+        cache_key = json.dumps(
+            {
+                "status": status.value if status else None,
+                "group": group,
+                "include_disabled": include_disabled,
+            },
+            sort_keys=True,
+        )
+        if cache_key in self._list_cache:
+            return [dict(agent) for agent in self._list_cache[cache_key]]
+
+        agents = list(self._agents.values())
         if status:
             agents = [a for a in agents if a["status"] == status.value]
         if group:
             agent_ids = self._index.get(group, [])
             agents = [a for a in agents if a["id"] in agent_ids]
-        return list(agents)
+        if not include_disabled:
+            visible_agents = [a for a in agents if a["status"] != AgentStatus.DISABLED.value]
+            filtered_count = len(agents) - len(visible_agents)
+            if filtered_count:
+                self._record_audit(
+                    "disabled_agents_filtered_from_listing",
+                    filtered_count=filtered_count,
+                    group=group,
+                    status=status.value if status else None,
+                )
+            agents = visible_agents
+
+        self._list_cache[cache_key] = [dict(agent) for agent in agents]
+        return [dict(agent) for agent in agents]
 
     def update_status(self, agent_id: str, status: AgentStatus) -> bool:
         if agent_id not in self._agents:
             return False
+        previous_status = self._agents[agent_id]["status"]
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
+        if previous_status != status.value:
+            self._invalidate_list_cache("status_changed", agent_id)
         return True
 
     def delete(self, agent_id: str) -> bool:
@@ -68,10 +131,14 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        self._invalidate_list_cache("agent_deleted", agent_id)
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def audit_events(self) -> List[Dict[str, Any]]:
+        return [dict(event) for event in self._audit_events]
 
 # 2019-01-29T11:24:49 update
 

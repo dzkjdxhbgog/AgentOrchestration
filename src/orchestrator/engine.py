@@ -51,7 +51,7 @@ class OrchestrationEngine:
             await hook(task)
 
         try:
-            agent = self.registry.get(agent_id)
+            agent = self.registry.resolve(agent_id)
             if not agent:
                 raise ValueError(f"Agent {agent_id} not found")
 

@@ -40,6 +40,49 @@ class TestAgentRegistry:
         agent = self.registry.get(agent_id)
         assert agent["status"] == "running"
 
+    def test_list_filters_disabled_agents_and_invalidates_cached_results(self):
+        active_id = self.registry.register("active-agent", "worker.processor")
+        disabled_id = self.registry.register("disabled-agent", "worker.analyzer")
+
+        assert len(self.registry.list(group="worker")) == 2
+
+        assert self.registry.update_status(disabled_id, AgentStatus.DISABLED)
+
+        workers = self.registry.list(group="worker")
+        assert [agent["id"] for agent in workers] == [active_id]
+
+        disabled = self.registry.list(status=AgentStatus.DISABLED)
+        assert disabled == []
+
+        disabled_for_admin = self.registry.list(
+            status=AgentStatus.DISABLED,
+            include_disabled=True,
+        )
+        assert [agent["id"] for agent in disabled_for_admin] == [disabled_id]
+
+        audit_events = self.registry.audit_events()
+        assert any(
+            event["event"] == "registry_listing_cache_invalidated"
+            for event in audit_events
+        )
+        assert any(
+            event["event"] == "disabled_agents_filtered_from_listing"
+            for event in audit_events
+        )
+
+    def test_resolve_defers_disabled_agent_without_removing_lifecycle_state(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+        assert self.registry.update_status(agent_id, AgentStatus.DISABLED)
+
+        assert self.registry.resolve(agent_id) is None
+        assert self.registry.get(agent_id)["status"] == AgentStatus.DISABLED.value
+
+        audit_events = self.registry.audit_events()
+        assert any(
+            event["event"] == "disabled_agent_resolution_deferred"
+            for event in audit_events
+        )
+
     def test_delete_agent(self):
         agent_id = self.registry.register("test-agent", "worker.processor")
         assert self.registry.delete(agent_id)
