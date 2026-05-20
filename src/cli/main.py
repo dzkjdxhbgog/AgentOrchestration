@@ -3,7 +3,12 @@
 import argparse
 import sys
 
-from src.common.config import Config
+from src.common.feature_flags import (
+    FeatureFlagValidationError,
+    load_feature_flag_manifest,
+    load_rendered_feature_flags,
+    validate_rendered_feature_flags,
+)
 from src.common.logging import configure_logging
 
 
@@ -19,6 +24,17 @@ def cli():
 
     deploy_parser = subparsers.add_parser("deploy", help="Deploy an agent")
     deploy_parser.add_argument("manifest", help="Path to agent manifest file")
+
+    flags_parser = subparsers.add_parser(
+        "validate-flags",
+        help="Validate production feature flag defaults",
+    )
+    flags_parser.add_argument("rendered", help="Path to rendered service feature flags JSON")
+    flags_parser.add_argument(
+        "--manifest",
+        default="config/required_feature_flags.json",
+        help="Path to required feature flag manifest JSON",
+    )
 
     status_parser = subparsers.add_parser("status", help="Show agent status")
     status_parser.add_argument("--watch", "-w", action="store_true", help="Watch mode")
@@ -38,6 +54,15 @@ def cli():
         print(f"Initializing project: {args.name}")
     elif args.command == "deploy":
         print(f"Deploying agent from manifest: {args.manifest}")
+    elif args.command == "validate-flags":
+        try:
+            manifest = load_feature_flag_manifest(args.manifest)
+            rendered = load_rendered_feature_flags(args.rendered)
+            validate_rendered_feature_flags(rendered, manifest)
+        except FeatureFlagValidationError as exc:
+            print(f"Feature flag validation failed: {exc}", file=sys.stderr)
+            sys.exit(2)
+        print("Feature flag validation passed")
     elif args.command == "status":
         print("Checking agent status...")
     elif args.command == "logs":

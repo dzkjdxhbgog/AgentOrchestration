@@ -1,0 +1,18 @@
+[
+  {
+    "name": "strict_scheduler_worker_contract",
+    "default": true,
+    "owner": "orchestrator-platform",
+    "description": "Keeps scheduler and worker task contract checks enabled during rollout.",
+    "services": ["scheduler", "worker"],
+    "required": true
+  },
+  {
+    "name": "task_retry_backoff_v2",
+    "default": false,
+    "owner": "orchestrator-platform",
+    "description": "Controls the next retry backoff path until scheduler and worker are both ready.",
+    "services": ["scheduler", "worker"],
+    "required": true
+  }
+]
