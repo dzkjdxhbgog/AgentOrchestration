@@ -32,6 +32,42 @@ class TestConfig:
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
 
+    def test_copies_input_data_at_boundaries(self):
+        source = {
+            "app": {
+                "features": ["alpha"],
+                "limits": {"workers": 2},
+            }
+        }
+        config = Config(data=source)
+
+        source["app"]["features"].append("beta")
+        source["app"]["limits"]["workers"] = 99
+
+        assert config.get("app.features") == ["alpha"]
+        assert config.get("app.limits.workers") == 2
+
+    def test_copies_values_set_into_config(self):
+        value = {"roles": ["reader"], "metadata": {"owner": "team-a"}}
+        config = Config()
+        config.set("auth.policy", value)
+
+        value["roles"].append("admin")
+        value["metadata"]["owner"] = "team-b"
+
+        assert config.get("auth.policy.roles") == ["reader"]
+        assert config.get("auth.policy.metadata.owner") == "team-a"
+
+    def test_returned_nested_values_do_not_mutate_config(self):
+        config = Config(data={"service": {"hosts": ["api-1"]}})
+
+        hosts = config.get("service.hosts")
+        hosts.append("api-2")
+        snapshot = config.to_dict()
+        snapshot["service"]["hosts"].append("api-3")
+
+        assert config.get("service.hosts") == ["api-1"]
+
 # 2019-02-01T18:58:35 update
 
 # 2019-07-31T13:45:15 update
