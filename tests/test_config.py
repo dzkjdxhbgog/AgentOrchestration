@@ -1,5 +1,5 @@
 import pytest
-from src.common.config import Config
+from src.common.config import Config, ConfigError
 
 
 class TestConfig:
@@ -31,6 +31,34 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_get_int_returns_json_number(self, tmp_path):
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"limits": {"memory_mb": 512}}')
+
+        config = Config(str(config_file))
+
+        assert config.get_int("limits.memory_mb") == 512
+
+    def test_get_int_parses_numeric_env_override(self, monkeypatch):
+        monkeypatch.setenv("AO_LIMITS_TIMEOUT_SECONDS", " 30 ")
+
+        config = Config()
+
+        assert config.get_int("limits.timeout.seconds") == 30
+
+    def test_get_int_returns_default_for_missing_key(self):
+        config = Config()
+
+        assert config.get_int("limits.max_retries", 3) == 3
+
+    @pytest.mark.parametrize("value", ["", "10.5", "many", True, 1.2])
+    def test_get_int_rejects_invalid_values(self, value):
+        config = Config()
+        config.set("limits.workers", value)
+
+        with pytest.raises(ConfigError, match="limits.workers"):
+            config.get_int("limits.workers")
 
 # 2019-02-01T18:58:35 update
 

@@ -5,6 +5,10 @@ import json
 from typing import Any, Dict, Optional
 
 
+class ConfigError(ValueError):
+    """Raised when configuration values cannot be read as requested."""
+
+
 class Config:
     def __init__(self, config_path: Optional[str] = None):
         self._data: Dict[str, Any] = {}
@@ -43,6 +47,22 @@ class Config:
             else:
                 return default
         return current
+
+    def get_int(self, key: str, default: Optional[int] = None) -> Optional[int]:
+        value = self.get(key, default)
+        if value is default:
+            return default
+        if isinstance(value, bool):
+            raise ConfigError(f"Configuration value '{key}' must be an integer")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped and stripped.lstrip("+-").isdigit():
+                return int(stripped, 10)
+        raise ConfigError(f"Configuration value '{key}' must be an integer")
 
     def set(self, key: str, value: Any) -> None:
         self._set_nested(key, value)
