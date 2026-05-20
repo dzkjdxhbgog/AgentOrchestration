@@ -32,6 +32,23 @@ class TestConfig:
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
 
+    def test_numeric_env_overrides_are_coerced(self, monkeypatch):
+        monkeypatch.setenv("AO_APP_PORT", "8080")
+        monkeypatch.setenv("AO_WORKER_RATIO", "0.75")
+        monkeypatch.setenv("AO_TIMEOUT_SECONDS", "-5")
+        monkeypatch.setenv("AO_COST_LIMIT", "1e-3")
+        monkeypatch.setenv("AO_RELEASE_VERSION", "1.2.3")
+
+        config = Config()
+
+        assert config.get("app.port") == 8080
+        assert isinstance(config.get("app.port"), int)
+        assert config.get("worker.ratio") == 0.75
+        assert isinstance(config.get("worker.ratio"), float)
+        assert config.get("timeout.seconds") == -5
+        assert config.get("cost.limit") == 0.001
+        assert config.get("release.version") == "1.2.3"
+
 # 2019-02-01T18:58:35 update
 
 # 2019-07-31T13:45:15 update
