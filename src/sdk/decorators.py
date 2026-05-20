@@ -2,11 +2,21 @@
 
 import functools
 import asyncio
+import math
+from numbers import Real
 from typing import Any, Callable, Dict, Optional
 
 
 def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
     """Decorator for marking a method as an agent task handler."""
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, Real)
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise ValueError("task timeout must be a positive finite number")
+
     def decorator(func: Callable) -> Callable:
         func.__task_config__ = {
             "name": name or func.__name__,
