@@ -23,6 +23,14 @@ class AgentExecutor:
             try:
                 result = await task_obj
                 self._results[execution_id] = result
+            except asyncio.CancelledError:
+                self._results[execution_id] = {
+                    "execution_id": execution_id,
+                    "agent_id": agent_id,
+                    "task_id": task.get("id"),
+                    "status": "cancelled",
+                    "timestamp": time.time(),
+                }
             except Exception as e:
                 self._results[execution_id] = {"error": str(e)}
             finally:
