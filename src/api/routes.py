@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.auth import Principal, require_template_clone_principal
 
 router = APIRouter()
 registry = AgentRegistry()
@@ -53,6 +54,28 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/templates/{template_id}/clone")
+async def clone_agent_template(
+    template_id: str,
+    name: Optional[str] = None,
+    principal: Principal = Depends(require_template_clone_principal),
+):
+    if not template_id.strip():
+        raise HTTPException(status_code=400, detail="Template id is required")
+
+    agent_id = registry.register(
+        name or f"{template_id}-clone",
+        f"template.{template_id}",
+        {
+            "template_id": template_id,
+            "workspace_id": principal.workspace_id,
+            "cloned_by": principal.subject,
+            "auth_source": principal.source,
+        },
+    )
+    return {"agent_id": agent_id, "status": "cloned"}
 
 # 2019-03-18T11:10:18 update
 
