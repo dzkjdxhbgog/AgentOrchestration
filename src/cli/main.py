@@ -5,6 +5,7 @@ import sys
 
 from src.common.config import Config
 from src.common.logging import configure_logging
+from src.deploy.migrations import MigrationRolloutGate, load_migration_manifest
 
 
 def cli():
@@ -19,6 +20,10 @@ def cli():
 
     deploy_parser = subparsers.add_parser("deploy", help="Deploy an agent")
     deploy_parser.add_argument("manifest", help="Path to agent manifest file")
+    deploy_parser.add_argument(
+        "--migration-manifest",
+        help="Path to migration manifest that must pass before rollout",
+    )
 
     status_parser = subparsers.add_parser("status", help="Show agent status")
     status_parser.add_argument("--watch", "-w", action="store_true", help="Watch mode")
@@ -37,6 +42,24 @@ def cli():
     if args.command == "init":
         print(f"Initializing project: {args.name}")
     elif args.command == "deploy":
+        if args.migration_manifest:
+            try:
+                migrations = load_migration_manifest(args.migration_manifest)
+                handlers = {migration.name: (lambda: True) for migration in migrations}
+                result = MigrationRolloutGate(
+                    migrations, handlers
+                ).run_before_traffic_shift()
+            except Exception as exc:
+                print(f"Migration validation failed: {exc}", file=sys.stderr)
+                sys.exit(1)
+
+            if not result.rollout_allowed:
+                print(
+                    "Migration validation failed: "
+                    + "; ".join(result.compatibility_errors),
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         print(f"Deploying agent from manifest: {args.manifest}")
     elif args.command == "status":
         print("Checking agent status...")
