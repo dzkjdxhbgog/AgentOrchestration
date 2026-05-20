@@ -14,7 +14,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
             token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
+            session_token = request.cookies.get("ao_session")
+            if not token.startswith("Bearer ") and not session_token:
                 return Response(status_code=401, content="Unauthorized")
         return await call_next(request)
 

@@ -3,9 +3,18 @@
 from .registry import AgentRegistry
 from .executor import AgentExecutor
 from .runtime import AgentRuntime
-from .sandbox import AgentSandbox
+from .registry import AgentStatus
 
-__all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
+
+def __getattr__(name):
+    if name == "AgentSandbox":
+        from .sandbox import AgentSandbox
+
+        return AgentSandbox
+    raise AttributeError(name)
+
+
+__all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox", "AgentStatus"]
 
 # 2019-02-05T12:34:30 update
 

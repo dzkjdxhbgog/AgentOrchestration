@@ -1,12 +1,68 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
+import time
+from fastapi import APIRouter, HTTPException, Depends, Header, Cookie, Path
 from typing import List, Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.auth import AuthorizationError, Principal, require_webhook_management
 
 router = APIRouter()
 registry = AgentRegistry()
+
+
+def _csv_header(value: Optional[str]) -> set[str]:
+    if not value:
+        return set()
+    return {part.strip() for part in value.split(",") if part.strip()}
+
+
+def _parse_bool(value: Optional[str]) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def current_principal(
+    authorization: Optional[str] = Header(default=None),
+    session_token: Optional[str] = Cookie(default=None, alias="ao_session"),
+    subject: Optional[str] = Header(default=None, alias="X-Principal-Id"),
+    principal_workspace_id: Optional[str] = Header(default=None, alias="X-Principal-Workspace"),
+    roles: Optional[str] = Header(default=None, alias="X-Principal-Roles"),
+    scopes: Optional[str] = Header(default=None, alias="X-Principal-Scopes"),
+    disabled: Optional[str] = Header(default=None, alias="X-Principal-Disabled"),
+    revoked: Optional[str] = Header(default=None, alias="X-Principal-Revoked"),
+    expires_at: Optional[str] = Header(default=None, alias="X-Principal-Expires-At"),
+) -> Principal:
+    has_token_client = bool(authorization and authorization.startswith("Bearer "))
+    has_browser_session = bool(session_token)
+
+    if not has_token_client and not has_browser_session:
+        return Principal(subject="anonymous", workspace_id="")
+
+    try:
+        parsed_expiry = float(expires_at) if expires_at else None
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="malformed principal expiry") from exc
+
+    return Principal(
+        subject=subject or "anonymous",
+        workspace_id=principal_workspace_id or "",
+        roles=_csv_header(roles),
+        scopes=_csv_header(scopes),
+        disabled=_parse_bool(disabled),
+        revoked=_parse_bool(revoked),
+        expires_at=parsed_expiry,
+    )
+
+
+def require_webhook_manager(
+    workspace_id: str = Path(...),
+    principal: Principal = Depends(current_principal),
+) -> Principal:
+    try:
+        require_webhook_management(principal, workspace_id, now=time.time())
+    except AuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return principal
 
 
 @router.get("/agents")
@@ -53,6 +109,20 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/workspaces/{workspace_id}/webhooks")
+async def manage_webhook(
+    workspace_id: str,
+    webhook: Dict,
+    principal: Principal = Depends(require_webhook_manager),
+):
+    return {
+        "status": "configured",
+        "workspace_id": workspace_id,
+        "actor": principal.subject,
+        "webhook": webhook,
+    }
 
 # 2019-03-18T11:10:18 update
 
