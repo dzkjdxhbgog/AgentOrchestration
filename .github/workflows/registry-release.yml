@@ -1,0 +1,55 @@
+name: Registry Release
+
+on:
+  push:
+    branches:
+      - main
+      - release/**
+    tags:
+      - v*
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Document the intended release ref; cannot override github.ref."
+        required: false
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release ref
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate protected publish ref
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          signed_tag=false
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag_name="${GITHUB_REF#refs/tags/}"
+            if git verify-tag "$tag_name" >/dev/null 2>&1; then
+              signed_tag=true
+            fi
+          fi
+
+          python -m src.ci.publish_guard \
+            --ref "$GITHUB_REF" \
+            --ref-protected "${GITHUB_REF_PROTECTED:-false}" \
+            --signed-tag "$signed_tag" \
+            --event "$GITHUB_EVENT_NAME" \
+            --manual-ref-input "${{ inputs.source_ref || '' }}"
+
+      - name: Authenticate package registry
+        if: success()
+        run: echo "Registry authentication starts only after publish ref validation."
+
+      - name: Publish package
+        if: success()
+        run: echo "Package publish placeholder"
