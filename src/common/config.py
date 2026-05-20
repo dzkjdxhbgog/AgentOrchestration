@@ -5,6 +5,10 @@ import json
 from typing import Any, Dict, Optional
 
 
+class ConfigError(ValueError):
+    """Raised when configuration values cannot be merged safely."""
+
+
 class Config:
     def __init__(self, config_path: Optional[str] = None):
         self._data: Dict[str, Any] = {}
@@ -26,10 +30,21 @@ class Config:
     def _set_nested(self, key: str, value: Any) -> None:
         parts = key.split(".")
         current = self._data
-        for part in parts[:-1]:
+        for index, part in enumerate(parts[:-1]):
             if part not in current:
                 current[part] = {}
+            elif not isinstance(current[part], dict):
+                path = ".".join(parts[: index + 1])
+                raise ConfigError(
+                    f"Cannot create config branch '{path}' because a scalar value "
+                    "already exists"
+                )
             current = current[part]
+        existing = current.get(parts[-1])
+        if isinstance(existing, dict) and not isinstance(value, dict):
+            raise ConfigError(
+                f"Cannot replace config branch '{key}' with scalar value"
+            )
         current[parts[-1]] = value
 
     def get(self, key: str, default: Any = None) -> Any:

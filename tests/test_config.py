@@ -1,5 +1,5 @@
 import pytest
-from src.common.config import Config
+from src.common.config import Config, ConfigError
 
 
 class TestConfig:
@@ -23,6 +23,21 @@ class TestConfig:
         config = Config()
         config.set("a.b.c.d", "value")
         assert config.get("a.b.c.d") == "value"
+
+    def test_env_override_cannot_replace_existing_branch(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"app": {"name": "test", "port": 8080}}')
+        monkeypatch.setenv("AO_APP", "replacement")
+
+        with pytest.raises(ConfigError, match="Cannot replace config branch 'app'"):
+            Config(str(config_file))
+
+    def test_nested_set_cannot_expand_scalar_value(self):
+        config = Config()
+        config.set("app", "scalar")
+
+        with pytest.raises(ConfigError, match="Cannot create config branch 'app'"):
+            config.set("app.name", "test")
 
     def test_to_dict(self):
         config = Config()
