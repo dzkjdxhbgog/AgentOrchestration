@@ -1,0 +1,54 @@
+name: Publish Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish from the checked-out release ref
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  validate-publish-ref:
+    name: Validate publish ref
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release ref
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Enforce protected branch or signed release tag
+        run: python tools/validate_publish_ref.py
+
+  publish:
+    name: Build and publish package
+    runs-on: ubuntu-latest
+    needs: validate-publish-ref
+    permissions:
+      contents: read
+      id-token: write
+    environment: package-registry
+    steps:
+      - name: Checkout validated ref
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Build package
+        run: uv build
+
+      - name: Publish to package registry
+        uses: pypa/gh-action-pypi-publish@release/v1
