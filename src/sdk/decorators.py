@@ -2,7 +2,16 @@
 
 import functools
 import asyncio
+import re
 from typing import Any, Callable, Dict, Optional
+
+SEMVER_PATTERN = re.compile(
+    r"^(0|[1-9]\d*)\."
+    r"(0|[1-9]\d*)\."
+    r"(0|[1-9]\d*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
 
 
 def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
@@ -29,12 +38,22 @@ def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
     return decorator
 
 
+def _validate_version(version: str) -> str:
+    if not isinstance(version, str):
+        raise ValueError("Agent version must be a semantic version string")
+    if not SEMVER_PATTERN.fullmatch(version):
+        raise ValueError("Agent version must match MAJOR.MINOR.PATCH")
+    return version
+
+
 def agent(name: str, version: str = "1.0.0", description: str = ""):
     """Decorator for marking a class as an agent definition."""
+    validated_version = _validate_version(version)
+
     def decorator(cls: type) -> type:
         cls.__agent_config__ = {
             "name": name,
-            "version": version,
+            "version": validated_version,
             "description": description,
         }
         return cls
