@@ -1,12 +1,19 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.integration_endpoints import integration_endpoint_service, UnsafeCallbackUrlError
 
 router = APIRouter()
 registry = AgentRegistry()
+
+
+class IntegrationEndpointRegistration(BaseModel):
+    name: str
+    callback_url: str
 
 
 @router.get("/agents")
@@ -53,6 +60,24 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/integrations/endpoints", status_code=201)
+async def register_integration_endpoint(registration: IntegrationEndpointRegistration):
+    try:
+        endpoint = integration_endpoint_service.register(
+            name=registration.name,
+            callback_url=registration.callback_url,
+        )
+    except UnsafeCallbackUrlError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return {
+        "endpoint_id": endpoint.endpoint_id,
+        "name": endpoint.name,
+        "callback_url": endpoint.callback_url,
+        "status": "registered",
+    }
 
 # 2019-03-18T11:10:18 update
 
