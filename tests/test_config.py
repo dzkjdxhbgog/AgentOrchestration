@@ -32,6 +32,18 @@ class TestConfig:
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
 
+    def test_env_overrides_ignore_runtime_only_agent_values(self, monkeypatch):
+        monkeypatch.setenv("AO_AGENT_ID", "runtime-agent-123")
+        monkeypatch.setenv("AO_APP_NAME", "env-app")
+        monkeypatch.setenv("AO_CONFIG_SCHEDULER_QUEUE", "critical")
+
+        config = Config()
+
+        assert config.get("app.name") == "env-app"
+        assert config.get("scheduler.queue") == "critical"
+        assert config.get("agent.id") is None
+        assert "agent" not in config.to_dict()
+
 # 2019-02-01T18:58:35 update
 
 # 2019-07-31T13:45:15 update

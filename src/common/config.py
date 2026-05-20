@@ -6,6 +6,16 @@ from typing import Any, Dict, Optional
 
 
 class Config:
+    ENV_OVERRIDE_PREFIX = "AO_CONFIG_"
+    ENV_OVERRIDE_ALLOWLIST = {
+        "AO_APP_NAME": "app.name",
+        "AO_APP_PORT": "app.port",
+        "AO_DATABASE_HOST": "database.host",
+        "AO_DATABASE_PORT": "database.port",
+        "AO_REDIS_URL": "redis.url",
+        "AO_LOG_LEVEL": "logging.level",
+    }
+
     def __init__(self, config_path: Optional[str] = None):
         self._data: Dict[str, Any] = {}
         if config_path:
@@ -17,11 +27,14 @@ class Config:
             self._data = json.load(f)
 
     def _load_env_overrides(self) -> None:
-        prefix = "AO_"
         for key, value in os.environ.items():
-            if key.startswith(prefix):
-                config_key = key[len(prefix):].lower().replace("_", ".")
-                self._set_nested(config_key, value)
+            if key in self.ENV_OVERRIDE_ALLOWLIST:
+                config_key = self.ENV_OVERRIDE_ALLOWLIST[key]
+            elif key.startswith(self.ENV_OVERRIDE_PREFIX):
+                config_key = key[len(self.ENV_OVERRIDE_PREFIX):].lower().replace("_", ".")
+            else:
+                continue
+            self._set_nested(config_key, value)
 
     def _set_nested(self, key: str, value: Any) -> None:
         parts = key.split(".")
