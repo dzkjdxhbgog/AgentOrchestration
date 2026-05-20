@@ -24,6 +24,28 @@ class TestMetricsCollector:
         assert snapshot["histograms"]["response.time"]["count"] == 2
         assert snapshot["histograms"]["response.time"]["avg"] == 1.0
 
+    def test_histogram_snapshot_computes_aggregate_once(self):
+        class CountingValues(list):
+            def __init__(self, values):
+                super().__init__(values)
+                self.iterations = 0
+
+            def __iter__(self):
+                self.iterations += 1
+                return super().__iter__()
+
+        values = CountingValues([0.5, 1.5, 3.0])
+        self.metrics._histograms["response.time"] = values
+
+        snapshot = self.metrics.snapshot()
+
+        assert snapshot["histograms"]["response.time"] == {
+            "count": 3,
+            "sum": 5.0,
+            "avg": pytest.approx(5.0 / 3),
+        }
+        assert values.iterations == 1
+
     def test_timer(self):
         self.metrics.start_timer("operation")
         import time
