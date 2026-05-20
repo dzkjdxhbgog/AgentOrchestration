@@ -2,12 +2,46 @@
 
 import argparse
 import sys
+from collections.abc import Callable
+from typing import Sequence
 
 from src.common.config import Config
 from src.common.logging import configure_logging
 
 
-def cli():
+DeployBackend = Callable[[str], None]
+
+
+def deploy_manifest(manifest: str) -> None:
+    """Deploy an agent manifest through the orchestrator backend."""
+    print(f"Deploying agent from manifest: {manifest}")
+
+
+def handle_init(args: argparse.Namespace) -> int:
+    print(f"Initializing project: {args.name}")
+    return 0
+
+
+def handle_deploy(args: argparse.Namespace, deploy_backend: DeployBackend = deploy_manifest) -> int:
+    try:
+        deploy_backend(args.manifest)
+    except Exception as exc:
+        print(f"Deploy failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def handle_status(args: argparse.Namespace) -> int:
+    print("Checking agent status...")
+    return 0
+
+
+def handle_logs(args: argparse.Namespace) -> int:
+    print(f"Fetching logs for agent: {args.agent_id}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Agent Orchestrator CLI")
     parser.add_argument("--config", "-c", help="Path to config file")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
@@ -16,39 +50,46 @@ def cli():
 
     init_parser = subparsers.add_parser("init", help="Initialize a new project")
     init_parser.add_argument("name", help="Project name")
+    init_parser.set_defaults(handler=handle_init)
 
     deploy_parser = subparsers.add_parser("deploy", help="Deploy an agent")
     deploy_parser.add_argument("manifest", help="Path to agent manifest file")
+    deploy_parser.set_defaults(handler=handle_deploy)
 
     status_parser = subparsers.add_parser("status", help="Show agent status")
     status_parser.add_argument("--watch", "-w", action="store_true", help="Watch mode")
+    status_parser.set_defaults(handler=handle_status)
 
     logs_parser = subparsers.add_parser("logs", help="View agent logs")
     logs_parser.add_argument("agent_id", help="Agent ID")
     logs_parser.add_argument("--tail", "-t", type=int, default=50, help="Number of lines")
+    logs_parser.set_defaults(handler=handle_logs)
 
-    args = parser.parse_args()
+    return parser
+
+
+def cli(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.config:
+        Config(args.config)
 
     if args.verbose:
         configure_logging("DEBUG")
     else:
         configure_logging("INFO")
 
-    if args.command == "init":
-        print(f"Initializing project: {args.name}")
-    elif args.command == "deploy":
-        print(f"Deploying agent from manifest: {args.manifest}")
-    elif args.command == "status":
-        print("Checking agent status...")
-    elif args.command == "logs":
-        print(f"Fetching logs for agent: {args.agent_id}")
-    else:
+    handler = getattr(args, "handler", None)
+    if handler is None:
         parser.print_help()
-        sys.exit(1)
+        return 1
+
+    return handler(args)
 
 
 if __name__ == "__main__":
-    cli()
+    sys.exit(cli())
 
 # 2019-01-03T18:44:00 update
 
