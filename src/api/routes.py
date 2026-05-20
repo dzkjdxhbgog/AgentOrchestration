@@ -66,6 +66,39 @@ async def upload_artifact(request: Request):
         "sha256": artifact.digest,
     }
 
+
+@router.post("/artifacts/{artifact_id}/upload", status_code=status.HTTP_201_CREATED)
+async def upload_named_artifact(artifact_id: str, request: Request):
+    artifact = await ingest_artifact_upload(request, artifact_id)
+    return {
+        "artifact_id": artifact.artifact_id,
+        "size": artifact.size,
+        "content_type": artifact.content_type,
+        "sha256": artifact.digest,
+    }
+
+
+@router.post(
+    "/workspaces/{workspace_id}/artifacts/{artifact_id}/upload",
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_workspace_artifact(
+    workspace_id: str,
+    artifact_id: str,
+    request: Request,
+):
+    artifact = await ingest_artifact_upload(
+        request,
+        artifact_id,
+        workspace_id=workspace_id,
+    )
+    return {
+        "artifact_id": artifact.artifact_id,
+        "size": artifact.size,
+        "content_type": artifact.content_type,
+        "sha256": artifact.digest,
+    }
+
 # 2019-03-18T11:10:18 update
 
 # 2019-04-22T13:58:05 update

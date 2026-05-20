@@ -15,12 +15,13 @@ def test_authorized_artifact_upload_is_stored():
     client = TestClient(create_app())
 
     response = client.post(
-        "/api/v2/artifacts",
+        "/api/v2/artifacts/model-bundle/upload",
         content=b"artifact-bytes",
         headers={**AUTH_HEADERS, "content-type": "application/octet-stream"},
     )
 
     assert response.status_code == 201
+    assert response.json()["artifact_id"] == "model-bundle"
     assert response.json()["size"] == len(b"artifact-bytes")
     assert response.json()["content_type"] == "application/octet-stream"
     assert artifact_store.count() == 1
@@ -29,7 +30,10 @@ def test_authorized_artifact_upload_is_stored():
 def test_unauthorized_artifact_upload_does_not_store():
     client = TestClient(create_app())
 
-    response = client.post("/api/v2/artifacts", content=b"artifact-bytes")
+    response = client.post(
+        "/api/v2/artifacts/model-bundle/upload",
+        content=b"artifact-bytes",
+    )
 
     assert response.status_code == 401
     assert artifact_store.count() == 0
@@ -38,7 +42,11 @@ def test_unauthorized_artifact_upload_does_not_store():
 def test_empty_artifact_upload_is_rejected_before_store():
     client = TestClient(create_app())
 
-    response = client.post("/api/v2/artifacts", content=b"", headers=AUTH_HEADERS)
+    response = client.post(
+        "/api/v2/artifacts/model-bundle/upload",
+        content=b"",
+        headers=AUTH_HEADERS,
+    )
 
     assert response.status_code == 400
     assert artifact_store.count() == 0
@@ -51,7 +59,38 @@ def test_oversized_artifact_upload_is_rejected_before_store(monkeypatch):
     )
     client = TestClient(create_app())
 
-    response = client.post("/api/v2/artifacts", content=b"12345", headers=AUTH_HEADERS)
+    response = client.post(
+        "/api/v2/artifacts/model-bundle/upload",
+        content=b"12345",
+        headers=AUTH_HEADERS,
+    )
 
     assert response.status_code == 413
     assert artifact_store.count() == 0
+
+
+def test_malformed_artifact_id_is_rejected_before_store():
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/api/v2/artifacts/bad$id/upload",
+        content=b"artifact-bytes",
+        headers=AUTH_HEADERS,
+    )
+
+    assert response.status_code == 400
+    assert artifact_store.count() == 0
+
+
+def test_workspace_artifact_upload_uses_shared_guard():
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/api/v2/workspaces/team-a/artifacts/model-bundle/upload",
+        content=b"workspace-artifact",
+        headers=AUTH_HEADERS,
+    )
+
+    assert response.status_code == 201
+    assert response.json()["artifact_id"] == "team-a/model-bundle"
+    assert artifact_store.count() == 1
