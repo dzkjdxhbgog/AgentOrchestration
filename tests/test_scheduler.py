@@ -36,6 +36,85 @@ class TestTaskScheduler:
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
 
+    def test_extend_visibility_timeout_is_persisted_and_idempotent(self):
+        self.scheduler.enqueue({"type": "long-running"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue(timeout=30))
+        original_deadline = task["visibility_deadline"]
+
+        assert self.scheduler.extend_visibility_timeout(
+            task["id"],
+            extension=60,
+            expected_version=1,
+            extension_id="worker-1-heartbeat-1",
+        )
+        extended_deadline = task["visibility_deadline"]
+
+        assert extended_deadline > original_deadline
+        assert task["visibility_version"] == 2
+        assert self.scheduler.extend_visibility_timeout(
+            task["id"],
+            extension=60,
+            expected_version=2,
+            extension_id="worker-1-heartbeat-1",
+        )
+        assert task["visibility_deadline"] == extended_deadline
+        assert task["visibility_version"] == 2
+        assert (
+            self.scheduler.audit_log[-1]["event"]
+            == "queue.visibility_extend_idempotent"
+        )
+
+    def test_stale_visibility_extension_preserves_in_flight_state(self):
+        self.scheduler.enqueue({"type": "long-running"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue(timeout=30))
+        original_deadline = task["visibility_deadline"]
+
+        assert not self.scheduler.extend_visibility_timeout(
+            task["id"],
+            extension=60,
+            expected_version=99,
+            extension_id="stale-heartbeat",
+        )
+
+        assert self.scheduler._in_flight[task["id"]] is task
+        assert task["visibility_deadline"] == original_deadline
+        assert task["visibility_version"] == 1
+        assert self.scheduler.audit_log[-1]["reason"] == "stale_version"
+
+    def test_expired_visibility_extension_is_rejected_without_mutation(self):
+        self.scheduler.enqueue({"type": "long-running"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue(timeout=30))
+        task["visibility_deadline"] = 0
+
+        assert not self.scheduler.extend_visibility_timeout(
+            task["id"],
+            extension=60,
+            expected_version=1,
+            extension_id="late-heartbeat",
+        )
+
+        assert self.scheduler._in_flight[task["id"]] is task
+        assert task["visibility_version"] == 1
+        assert self.scheduler.audit_log[-1]["reason"] == "expired"
+
+    def test_stale_ack_does_not_complete_or_retry_task(self):
+        self.scheduler.enqueue({"type": "long-running"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue(timeout=30))
+        assert self.scheduler.extend_visibility_timeout(
+            task["id"],
+            extension=60,
+            expected_version=1,
+            extension_id="worker-1-heartbeat-1",
+        )
+
+        assert not self.scheduler.complete(task["id"], expected_version=1)
+        assert task["id"] in self.scheduler._in_flight
+        assert self.scheduler.complete(task["id"], expected_version=2)
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update

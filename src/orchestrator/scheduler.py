@@ -35,6 +35,8 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._visibility_extensions: Dict[str, Dict[str, float]] = {}
+        self.audit_log = []
         self._max_retries = 3
 
     def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
@@ -48,13 +50,17 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self, task: Dict, delay: float, queue: str = "default", priority: int = 0
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self, queue: str = "default", timeout: float = 1.0
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -65,21 +71,122 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                task["queue"] = queue
+                task["visibility_deadline"] = now + timeout
+                task["visibility_version"] = 1
                 self._in_flight[task["id"]] = task
+                self._audit(
+                    "queue.claimed",
+                    task["id"],
+                    queue=queue,
+                    visibility_version=task["visibility_version"],
+                )
                 return task
         return None
 
-    def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+    def extend_visibility_timeout(
+        self,
+        task_id: str,
+        extension: float,
+        expected_version: Optional[int] = None,
+        extension_id: Optional[str] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
+        if not task:
+            self._audit(
+                "queue.visibility_extend_rejected", task_id, reason="not_in_flight"
+            )
+            return False
+        if extension <= 0:
+            self._audit(
+                "queue.visibility_extend_rejected",
+                task_id,
+                reason="invalid_extension",
+            )
+            return False
+        if (
+            expected_version is not None
+            and task.get("visibility_version") != expected_version
+        ):
+            self._audit(
+                "queue.visibility_extend_rejected", task_id, reason="stale_version"
+            )
+            return False
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
+        applied_extensions = self._visibility_extensions.setdefault(task_id, {})
+        if extension_id and extension_id in applied_extensions:
+            self._audit(
+                "queue.visibility_extend_idempotent",
+                task_id,
+                extension_id=extension_id,
+            )
+            return True
+
+        now = time.time()
+        current_deadline = task.get("visibility_deadline", 0)
+        if current_deadline <= now:
+            self._audit("queue.visibility_extend_rejected", task_id, reason="expired")
+            return False
+
+        new_deadline = max(current_deadline, now) + extension
+        task["visibility_deadline"] = new_deadline
+        task["visibility_version"] = task.get("visibility_version", 1) + 1
+        if extension_id:
+            applied_extensions[extension_id] = new_deadline
+        self._audit(
+            "queue.visibility_extended",
+            task_id,
+            visibility_version=task["visibility_version"],
+        )
+        return True
+
+    def complete(self, task_id: str, expected_version: Optional[int] = None) -> bool:
+        task = self._in_flight.get(task_id)
+        if not task:
+            return False
+        if (
+            expected_version is not None
+            and task.get("visibility_version") != expected_version
+        ):
+            self._audit("queue.ack_rejected", task_id, reason="stale_version")
+            return False
+        self._in_flight.pop(task_id, None)
+        self._visibility_extensions.pop(task_id, None)
+        self._audit("queue.completed", task_id)
+        return True
+
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        expected_version: Optional[int] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
         if task:
+            if (
+                expected_version is not None
+                and task.get("visibility_version") != expected_version
+            ):
+                self._audit("queue.ack_rejected", task_id, reason="stale_version")
+                return False
+            self._in_flight.pop(task_id, None)
+            self._visibility_extensions.pop(task_id, None)
             task["retries"] += 1
             if task["retries"] < self._max_retries:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
+                self._audit("queue.retried", task_id, queue=queue)
                 return True
         return False
+
+    def _audit(self, event: str, task_id: str, **fields: Any) -> None:
+        self.audit_log.append(
+            {
+                "event": event,
+                "task_id": task_id,
+                "timestamp": time.time(),
+                **fields,
+            }
+        )
 
 # 2019-04-25T08:37:12 update
 
