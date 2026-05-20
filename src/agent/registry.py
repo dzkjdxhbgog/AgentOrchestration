@@ -1,6 +1,5 @@
-"""Agent Registry — Manages agent lifecycle and metadata."""
+"""Agent Registry - Manages agent lifecycle and metadata."""
 
-import json
 import time
 import uuid
 from enum import Enum
@@ -21,8 +20,16 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._permission_versions: Dict[str, int] = {}
+        self._resolution_cache: Dict[str, Dict[str, Any]] = {}
+        self.audit_log: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -36,6 +43,7 @@ class AgentRegistry:
             "version": "1.0.0",
             "metrics": {"tasks_completed": 0, "errors": 0, "uptime": 0},
         }
+        self._permission_versions[agent_id] = 1
         group = agent_type.split(".")[0]
         if group not in self._index:
             self._index[group] = []
@@ -45,7 +53,11 @@ class AgentRegistry:
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -54,12 +66,99 @@ class AgentRegistry:
             agents = [a for a in agents if a["id"] in agent_ids]
         return list(agents)
 
-    def update_status(self, agent_id: str, status: AgentStatus) -> bool:
+    def update_status(
+        self,
+        agent_id: str,
+        status: AgentStatus,
+        *,
+        principal: Optional[str] = None,
+        scope: str = "run",
+    ) -> bool:
         if agent_id not in self._agents:
+            return False
+        agent = self._agents[agent_id]
+        if not self._can_transition(agent, status, principal, scope):
+            self._audit(
+                "lifecycle_transition_denied",
+                agent_id,
+                principal or "-",
+                scope,
+                reason="authorization_recheck_failed",
+            )
             return False
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
+        self._invalidate_resolution_cache(
+            agent_id,
+            reason="lifecycle_status_changed",
+        )
         return True
+
+    def update_permissions(
+        self,
+        agent_id: str,
+        *,
+        principals: Optional[List[str]] = None,
+        scopes: Optional[List[str]] = None,
+    ) -> bool:
+        if agent_id not in self._agents:
+            return False
+
+        auth_config = self._agents[agent_id].setdefault(
+            "config",
+            {},
+        ).setdefault("authorization", {})
+        if principals is not None:
+            auth_config["principals"] = list(principals)
+        if scopes is not None:
+            auth_config["scopes"] = list(scopes)
+
+        self._permission_versions[agent_id] = (
+            self._permission_versions.get(agent_id, 0) + 1
+        )
+        self._agents[agent_id]["updated_at"] = time.time()
+        self._invalidate_resolution_cache(agent_id, reason="permission_changed")
+        return True
+
+    def resolve_for_principal(
+        self,
+        agent_id: str,
+        principal: str,
+        *,
+        scope: str = "run",
+    ) -> Optional[Dict[str, Any]]:
+        agent = self._agents.get(agent_id)
+        if agent is None:
+            return None
+
+        cache_key = self._cache_key(agent_id, principal, scope)
+        version = self._permission_versions.get(agent_id, 0)
+        cached = self._resolution_cache.get(cache_key)
+        if cached and cached["permission_version"] == version:
+            if self._is_authorized(agent, principal, scope):
+                self._audit("resolution_cache_hit", agent_id, principal, scope)
+                return dict(agent)
+            self._resolution_cache.pop(cache_key, None)
+            self._audit("resolution_cache_rejected", agent_id, principal, scope)
+            raise PermissionError(
+                f"principal {principal} is not authorized for agent {agent_id}"
+            )
+
+        if not self._is_authorized(agent, principal, scope):
+            self._resolution_cache.pop(cache_key, None)
+            self._audit("resolution_denied", agent_id, principal, scope)
+            raise PermissionError(
+                f"principal {principal} is not authorized for agent {agent_id}"
+            )
+
+        resolved = dict(agent)
+        self._resolution_cache[cache_key] = {
+            "agent": resolved,
+            "permission_version": version,
+            "cached_at": time.time(),
+        }
+        self._audit("resolution_cache_store", agent_id, principal, scope)
+        return dict(resolved)
 
     def delete(self, agent_id: str) -> bool:
         if agent_id not in self._agents:
@@ -68,10 +167,87 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        self._permission_versions.pop(agent_id, None)
+        self._invalidate_resolution_cache(agent_id, reason="agent_deleted")
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def _can_transition(
+        self,
+        agent: Dict[str, Any],
+        status: AgentStatus,
+        principal: Optional[str],
+        scope: str,
+    ) -> bool:
+        if status != AgentStatus.RUNNING:
+            return True
+
+        auth_config = agent.get("config", {}).get("authorization", {})
+        policy_requires_principal = bool(
+            auth_config.get("principals") or auth_config.get("scopes")
+        )
+        if policy_requires_principal and principal is None:
+            return False
+        return self._is_authorized(agent, principal, scope)
+
+    def _is_authorized(
+        self,
+        agent: Dict[str, Any],
+        principal: Optional[str],
+        scope: str,
+    ) -> bool:
+        if agent.get("status") in {
+            AgentStatus.STOPPED.value,
+            AgentStatus.FAILED.value,
+            AgentStatus.TERMINATED.value,
+        }:
+            return False
+
+        auth_config = agent.get("config", {}).get("authorization", {})
+        principals = auth_config.get("principals")
+        scopes = auth_config.get("scopes")
+
+        principal_allowed = principals is None or principal in principals
+        scope_allowed = scopes is None or scope in scopes
+        return principal_allowed and scope_allowed
+
+    def _invalidate_resolution_cache(self, agent_id: str, *, reason: str) -> None:
+        for cache_key in list(self._resolution_cache):
+            if cache_key.startswith(f"{agent_id}:"):
+                self._resolution_cache.pop(cache_key, None)
+        self._audit(
+            "resolution_cache_invalidated",
+            agent_id,
+            "-",
+            "-",
+            reason=reason,
+        )
+
+    def _cache_key(self, agent_id: str, principal: str, scope: str) -> str:
+        return f"{agent_id}:{principal}:{scope}"
+
+    def _audit(
+        self,
+        event: str,
+        agent_id: str,
+        principal: str,
+        scope: str,
+        *,
+        reason: Optional[str] = None,
+    ) -> None:
+        record = {
+            "event": event,
+            "agent_id": agent_id,
+            "principal": principal,
+            "scope": scope,
+            "permission_version": self._permission_versions.get(agent_id, 0),
+            "timestamp": time.time(),
+        }
+        if reason:
+            record["reason"] = reason
+        self.audit_log.append(record)
 
 # 2019-01-29T11:24:49 update
 

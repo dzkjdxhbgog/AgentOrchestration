@@ -51,11 +51,29 @@ class OrchestrationEngine:
             await hook(task)
 
         try:
-            agent = self.registry.get(agent_id)
+            principal = task.get("principal")
+            scope = task.get("scope", "run")
+            if principal:
+                agent = self.registry.resolve_for_principal(
+                    agent_id,
+                    principal,
+                    scope=scope,
+                )
+            else:
+                agent = self.registry.get(agent_id)
             if not agent:
                 raise ValueError(f"Agent {agent_id} not found")
 
-            self.registry.update_status(agent_id, AgentStatus.RUNNING)
+            if not self.registry.update_status(
+                agent_id,
+                AgentStatus.RUNNING,
+                principal=principal,
+                scope=scope,
+            ):
+                raise PermissionError(
+                    f"Agent {agent_id} is not authorized for {scope}"
+                )
+            agent = self.registry.get(agent_id)
             result = await asyncio.wait_for(
                 self._run_agent_task(agent, task),
                 timeout=self.agent_timeout,

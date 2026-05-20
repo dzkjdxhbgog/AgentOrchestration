@@ -40,6 +40,102 @@ class TestAgentRegistry:
         agent = self.registry.get(agent_id)
         assert agent["status"] == "running"
 
+    def test_permission_change_invalidates_cached_resolution(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {
+                "authorization": {
+                    "principals": ["alice"],
+                    "scopes": ["run"],
+                },
+            },
+        )
+
+        resolved = self.registry.resolve_for_principal(agent_id, "alice")
+        assert resolved is not None
+
+        assert self.registry.update_permissions(agent_id, principals=["bob"])
+
+        with pytest.raises(PermissionError):
+            self.registry.resolve_for_principal(agent_id, "alice")
+
+        agent = self.registry.get(agent_id)
+        assert agent["status"] == "pending"
+        assert any(
+            event["event"] == "resolution_cache_invalidated"
+            and event.get("reason") == "permission_changed"
+            for event in self.registry.audit_log
+        )
+        assert any(
+            event["event"] == "resolution_denied"
+            for event in self.registry.audit_log
+        )
+
+    def test_cached_resolution_rechecks_direct_policy_change(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {"authorization": {"principals": ["alice"]}},
+        )
+        self.registry.resolve_for_principal(agent_id, "alice")
+
+        agent = self.registry.get(agent_id)
+        agent["config"]["authorization"]["principals"] = ["bob"]
+
+        with pytest.raises(PermissionError):
+            self.registry.resolve_for_principal(agent_id, "alice")
+
+        assert any(
+            event["event"] == "resolution_cache_rejected"
+            for event in self.registry.audit_log
+        )
+
+    def test_lifecycle_transition_rechecks_authorization(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {
+                "authorization": {
+                    "principals": ["alice"],
+                    "scopes": ["run"],
+                },
+            },
+        )
+        self.registry.resolve_for_principal(agent_id, "alice")
+        self.registry.update_permissions(agent_id, principals=["bob"])
+
+        allowed = self.registry.update_status(
+            agent_id,
+            AgentStatus.RUNNING,
+            principal="alice",
+        )
+
+        assert not allowed
+        agent = self.registry.get(agent_id)
+        assert agent["status"] == "pending"
+        assert any(
+            event["event"] == "lifecycle_transition_denied"
+            for event in self.registry.audit_log
+        )
+
+    def test_cached_resolution_returns_current_lifecycle_state(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {"authorization": {"principals": ["alice"]}},
+        )
+        self.registry.resolve_for_principal(agent_id, "alice")
+
+        assert self.registry.update_status(
+            agent_id,
+            AgentStatus.RUNNING,
+            principal="alice",
+        )
+
+        resolved = self.registry.resolve_for_principal(agent_id, "alice")
+        assert resolved["status"] == "running"
+
     def test_delete_agent(self):
         agent_id = self.registry.register("test-agent", "worker.processor")
         assert self.registry.delete(agent_id)
@@ -47,6 +143,66 @@ class TestAgentRegistry:
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
+
+    def test_resolution_cache_rechecks_permissions_after_change(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {"authorization": {"principals": ["alice"], "scopes": ["run"]}},
+        )
+
+        first = self.registry.resolve_for_principal(agent_id, "alice", scope="run")
+        assert first["id"] == agent_id
+        assert len(self.registry._resolution_cache) == 1
+
+        assert self.registry.update_permissions(agent_id, principals=["bob"], scopes=["run"])
+
+        with pytest.raises(PermissionError):
+            self.registry.resolve_for_principal(agent_id, "alice", scope="run")
+        assert len(self.registry._resolution_cache) == 0
+
+    def test_permission_change_invalidates_only_affected_resolution_cache(self):
+        first_id = self.registry.register(
+            "agent-1",
+            "worker.processor",
+            {"authorization": {"principals": ["alice"], "scopes": ["run"]}},
+        )
+        second_id = self.registry.register(
+            "agent-2",
+            "worker.analyzer",
+            {"authorization": {"principals": ["alice"], "scopes": ["run"]}},
+        )
+        self.registry.resolve_for_principal(first_id, "alice", scope="run")
+        self.registry.resolve_for_principal(second_id, "alice", scope="run")
+
+        assert self.registry.update_permissions(first_id, principals=["bob"])
+
+        assert len(self.registry._resolution_cache) == 1
+        remaining = next(iter(self.registry._resolution_cache))
+        assert remaining.startswith(f"{second_id}:")
+        assert any(
+            event["event"] == "resolution_cache_invalidated"
+            and event["agent_id"] == first_id
+            and event["reason"] == "permission_changed"
+            for event in self.registry.audit_log
+        )
+
+    def test_cached_resolution_rejects_scope_removed_without_returning_stale_agent(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            {"authorization": {"principals": ["alice"], "scopes": ["run", "inspect"]}},
+        )
+        self.registry.resolve_for_principal(agent_id, "alice", scope="inspect")
+
+        assert self.registry.update_permissions(agent_id, scopes=["run"])
+
+        with pytest.raises(PermissionError):
+            self.registry.resolve_for_principal(agent_id, "alice", scope="inspect")
+        assert not any(
+            entry["event"] == "resolution_cache_hit" and entry["scope"] == "inspect"
+            for entry in self.registry.audit_log[-2:]
+        )
 
 # 2019-01-23T10:28:57 update
 
