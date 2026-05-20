@@ -11,12 +11,30 @@ logger = logging.getLogger(__name__)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
+    @staticmethod
+    def _is_cors_preflight(request: Request) -> bool:
+        return (
+            request.method == "OPTIONS"
+            and "origin" in request.headers
+            and "access-control-request-method" in request.headers
+        )
+
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+            if self._is_cors_preflight(request):
+                return await call_next(request)
+
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
-        return await call_next(request)
+
+            request.state.auth_context = {"authenticated": True}
+
+        try:
+            return await call_next(request)
+        finally:
+            if hasattr(request.state, "auth_context"):
+                delattr(request.state, "auth_context")
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
