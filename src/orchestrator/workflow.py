@@ -1,8 +1,11 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import time
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+from src.common.metrics import metrics
 
 
 class StepStatus(Enum):
@@ -14,15 +17,26 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        compensation_handler: Optional[Callable[[], Any]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.compensation_handler = compensation_handler
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
+        self.compensation_result: Any = None
+        self.compensation_error: Optional[str] = None
+        self.blocked_reason: Optional[str] = None
 
 
 class Workflow:
@@ -33,6 +47,7 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.audit_log: List[Dict[str, Any]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -67,20 +82,93 @@ class WorkflowManager:
             return False
 
         workflow.status = StepStatus.RUNNING
-        for step in workflow.steps:
+        completed_steps: List[WorkflowStep] = []
+        for index, step in enumerate(workflow.steps):
             step.status = StepStatus.RUNNING
             try:
                 result = step.handler()
                 step.result = result
                 step.status = StepStatus.COMPLETED
+                completed_steps.append(step)
             except Exception as e:
                 step.error = str(e)
                 step.status = StepStatus.FAILED
                 workflow.status = StepStatus.FAILED
+                compensation_ok = self._compensate_completed_steps(
+                    workflow,
+                    completed_steps,
+                )
+                reason = "step_failed"
+                if not compensation_ok:
+                    reason = "partial_rollback"
+                self._block_downstream(workflow, index + 1, reason)
                 return False
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _compensate_completed_steps(
+        self,
+        workflow: Workflow,
+        completed_steps: List[WorkflowStep],
+    ) -> bool:
+        compensation_ok = True
+        for step in reversed(completed_steps):
+            if not step.compensation_handler:
+                continue
+            try:
+                step.compensation_result = step.compensation_handler()
+                metrics.increment("workflow.compensation.succeeded")
+                self._audit(
+                    workflow,
+                    "workflow.compensation.succeeded",
+                    step,
+                    "completed_step_compensated",
+                )
+            except Exception as e:
+                compensation_ok = False
+                step.compensation_error = str(e)
+                metrics.increment("workflow.compensation.failed")
+                self._audit(
+                    workflow,
+                    "workflow.compensation.failed",
+                    step,
+                    "completed_step_compensation_failed",
+                )
+        return compensation_ok
+
+    def _block_downstream(
+        self,
+        workflow: Workflow,
+        start_index: int,
+        reason: str,
+    ) -> None:
+        for step in workflow.steps[start_index:]:
+            if step.status is not StepStatus.PENDING:
+                continue
+            step.status = StepStatus.SKIPPED
+            step.blocked_reason = reason
+            metrics.increment("workflow.downstream_blocked")
+            self._audit(workflow, "workflow.downstream_blocked", step, reason)
+
+    def _audit(
+        self,
+        workflow: Workflow,
+        event: str,
+        step: WorkflowStep,
+        reason: str,
+    ) -> None:
+        workflow.audit_log.append(
+            {
+                "event": event,
+                "workflow_id": workflow.id,
+                "step_id": step.id,
+                "step_name": step.name,
+                "step_status": step.status.value,
+                "reason": reason,
+                "timestamp": time.time(),
+            }
+        )
 
 # 2019-03-27T19:58:07 update
 
