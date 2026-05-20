@@ -9,6 +9,8 @@ from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+RESERVED_CHILD_ENV_KEYS = frozenset({"AO_AGENT_ID"})
+
 
 class RuntimeState(Enum):
     STOPPED = "stopped"
@@ -28,6 +30,7 @@ class AgentRuntime:
             logger.warning(f"Agent {agent_id} is already running")
             return False
 
+        self._reject_reserved_env_overrides(env)
         self._states[agent_id] = RuntimeState.STARTING
         process_env = os.environ.copy()
         if env:
@@ -49,6 +52,15 @@ class AgentRuntime:
             self._states[agent_id] = RuntimeState.CRASHED
             logger.error(f"Failed to start agent {agent_id}: {e}")
             return False
+
+    def _reject_reserved_env_overrides(self, env: Optional[Dict]) -> None:
+        if not env:
+            return
+
+        reserved_overrides = RESERVED_CHILD_ENV_KEYS.intersection(env)
+        if reserved_overrides:
+            keys = ", ".join(sorted(reserved_overrides))
+            raise ValueError(f"Reserved child environment keys cannot be overridden: {keys}")
 
     def stop(self, agent_id: str, timeout: int = 10) -> bool:
         proc = self._processes.get(agent_id)
