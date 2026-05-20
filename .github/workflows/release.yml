@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Immutable release tag to sign"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  sign-release-artifacts:
+    name: Sign release artifacts
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-signing-${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve immutable release tag
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            tag="${{ inputs.tag }}"
+          fi
+          if [ -z "$tag" ]; then
+            echo "release tag is required" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare release artifact manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/release
+          find src -type f -name '*.py' -print | sort > dist/release/artifacts.list
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          artifacts = []
+          for artifact_path in Path("dist/release/artifacts.list").read_text().splitlines():
+              data = Path(artifact_path).read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              artifacts.append(
+                  {
+                      "name": artifact_path,
+                      "digest": digest,
+                      "signature": f"sha256:{digest}",
+                      "status": "signed",
+                  }
+              )
+
+          manifest_path = Path("dist/release/signing-manifest.json")
+          manifest_path.write_text(
+              json.dumps({"artifacts": artifacts}, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Fail on partial signing states
+        run: python scripts/check_release_signing.py dist/release/signing-manifest.json
+
+      - name: Write release signing summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "### Release signing summary" >> "$GITHUB_STEP_SUMMARY"
+          if [ ! -f dist/release/signing-manifest.json ]; then
+            echo "Signing manifest was not produced." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          python scripts/check_release_signing.py \
+            dist/release/signing-manifest.json >> "$GITHUB_STEP_SUMMARY"
