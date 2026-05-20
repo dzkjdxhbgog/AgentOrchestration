@@ -1,9 +1,10 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException, Request, status
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.orchestrator.artifacts import ingest_artifact_upload
 
 router = APIRouter()
 registry = AgentRegistry()
@@ -53,6 +54,17 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/artifacts", status_code=status.HTTP_201_CREATED)
+async def upload_artifact(request: Request):
+    artifact = await ingest_artifact_upload(request)
+    return {
+        "artifact_id": artifact.artifact_id,
+        "size": artifact.size,
+        "content_type": artifact.content_type,
+        "sha256": artifact.digest,
+    }
 
 # 2019-03-18T11:10:18 update
 
