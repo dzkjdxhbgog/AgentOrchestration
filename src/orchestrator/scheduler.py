@@ -1,9 +1,9 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from copy import deepcopy
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -35,6 +35,8 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._finalizing: Dict[str, Dict] = {}
+        self._completed: Dict[str, Dict] = {}
         self._max_retries = 3
 
     def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
@@ -69,8 +71,47 @@ class TaskScheduler:
                 return task
         return None
 
-    def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+    def complete(
+        self,
+        task_id: str,
+        artifact_manifest: Optional[List[Dict[str, Any]]] = None,
+        manifest_writer: Optional[Callable[[List[Dict[str, Any]]], Any]] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
+        if not task:
+            return False
+
+        manifest = deepcopy(artifact_manifest) if artifact_manifest is not None else []
+        finalizing_task = dict(task)
+        finalizing_task["status"] = "finalizing"
+        finalizing_task["artifact_manifest"] = manifest
+        finalizing_task["finalizing_at"] = time.time()
+        self._finalizing[task_id] = finalizing_task
+
+        try:
+            manifest_ref = manifest_writer(manifest) if manifest_writer else manifest
+        except Exception as e:
+            self._finalizing.pop(task_id, None)
+            task["finalization_error"] = str(e)
+            return False
+
+        completed_task = dict(finalizing_task)
+        completed_task["status"] = "completed"
+        completed_task["artifact_manifest"] = manifest_ref
+        completed_task["completed_at"] = time.time()
+        self._completed[task_id] = completed_task
+        self._finalizing.pop(task_id, None)
+        self._in_flight.pop(task_id, None)
+        return True
+
+    def get_completed(self, task_id: str) -> Optional[Dict]:
+        return self._completed.get(task_id)
+
+    def list_completed(self) -> List[Dict]:
+        return list(self._completed.values())
+
+    def is_finalizing(self, task_id: str) -> bool:
+        return task_id in self._finalizing
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)

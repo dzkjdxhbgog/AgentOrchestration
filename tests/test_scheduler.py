@@ -29,12 +29,49 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
+        completed = self.scheduler.get_completed(task["id"])
+        assert completed is not None
+        assert completed["status"] == "completed"
+        assert completed["artifact_manifest"] == []
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_complete_commits_manifest_before_task_is_visible(self):
+        self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        manifest = [{"path": "result.json", "checksum": "sha256:abc"}]
+
+        assert self.scheduler.complete(task["id"], artifact_manifest=manifest)
+
+        completed = self.scheduler.get_completed(task["id"])
+        assert completed is not None
+        assert completed["artifact_manifest"] == manifest
+        assert completed in self.scheduler.list_completed()
+        assert not self.scheduler.is_finalizing(task["id"])
+
+    def test_manifest_write_failure_does_not_expose_completed_task(self):
+        self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        def fail_write(manifest):
+            raise RuntimeError("manifest store unavailable")
+
+        assert not self.scheduler.complete(
+            task["id"],
+            artifact_manifest=[{"path": "partial.log"}],
+            manifest_writer=fail_write,
+        )
+
+        assert self.scheduler.get_completed(task["id"]) is None
+        assert self.scheduler.list_completed() == []
+        assert not self.scheduler.is_finalizing(task["id"])
+        assert "finalization_error" in task
 
 # 2019-01-09T19:07:03 update
 

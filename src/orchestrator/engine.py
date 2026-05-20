@@ -65,6 +65,10 @@ class OrchestrationEngine:
             for hook in self._hooks["post_execute"]:
                 await hook(task, result)
 
+            manifest = result.get("artifact_manifest", []) if isinstance(result, dict) else []
+            if not self.scheduler.complete(task_id, artifact_manifest=manifest):
+                raise RuntimeError(f"Task {task_id} finalization failed")
+
             logger.info(f"Task {task_id} completed successfully")
 
         except Exception as e:
