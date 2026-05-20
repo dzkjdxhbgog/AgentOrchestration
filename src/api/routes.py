@@ -1,12 +1,19 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import Dict, Optional
 
-from src.agent import AgentRegistry, AgentStatus
+from src.agent.registry import AgentRegistry, AgentStatus
+from src.api.approvals import ApprovalError, approval_service
 
 router = APIRouter()
 registry = AgentRegistry()
+
+
+class HumanApprovalRequest(BaseModel):
+    approved: bool
+    actor: Optional[str] = None
 
 
 @router.get("/agents")
@@ -53,6 +60,19 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/runs/{run_id}/human-steps/{step_id}/approve")
+async def approve_human_step(run_id: str, step_id: str, request: HumanApprovalRequest):
+    try:
+        return approval_service.approve_human_step(
+            run_id=run_id,
+            step_id=step_id,
+            approved=request.approved,
+            actor=request.actor,
+        )
+    except ApprovalError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
 
 # 2019-03-18T11:10:18 update
 
