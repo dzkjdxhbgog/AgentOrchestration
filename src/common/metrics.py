@@ -1,14 +1,16 @@
 """Metrics collection and reporting."""
 
+import math
 import time
 from collections import defaultdict
+from numbers import Real
+from threading import RLock
 from typing import Dict, List
-from threading import Lock
 
 
 class MetricsCollector:
     def __init__(self):
-        self._lock = Lock()
+        self._lock = RLock()
         self._counters: Dict[str, int] = defaultdict(int)
         self._gauges: Dict[str, float] = {}
         self._histograms: Dict[str, List[float]] = defaultdict(list)
@@ -19,8 +21,15 @@ class MetricsCollector:
             self._counters[metric] += value
 
     def gauge(self, metric: str, value: float) -> None:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise TypeError("Gauge values must be numeric.")
+
+        gauge_value = float(value)
+        if not math.isfinite(gauge_value):
+            raise ValueError("Gauge values must be finite.")
+
         with self._lock:
-            self._gauges[metric] = value
+            self._gauges[metric] = gauge_value
 
     def observe(self, metric: str, value: float) -> None:
         with self._lock:
