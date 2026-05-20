@@ -1,0 +1,37 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      digest-manifest:
+        description: "Path to the per-architecture digest manifest JSON"
+        required: true
+        default: "release/digests.json"
+
+jobs:
+  publish-multiarch-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate architecture digests before manifest push
+        run: |
+          python .github/scripts/validate_multiarch_release.py \
+            "${{ inputs.digest-manifest }}" \
+            --required linux/amd64 linux/arm64 \
+            --output release/validated-digests.json
+
+      - name: Publish multi-architecture manifest
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path("release/validated-digests.json").read_text())
+          digests = " ".join(entry["digest"] for entry in manifest["architectures"])
+          print(f"Ready to publish validated multi-arch manifest with: {digests}")
+          PY
