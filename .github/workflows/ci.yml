@@ -15,6 +15,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Runner provenance preflight
+        env:
+          AO_RUNNER_LABELS: ${{ runner.os }},${{ runner.arch }}
+          AO_RUNNER_IMAGE_DIGEST: ${{ vars.AO_RUNNER_IMAGE_DIGEST }}
+          AO_APPROVED_RUNNER_DIGESTS: ${{ vars.AO_APPROVED_RUNNER_DIGESTS }}
+          AO_RUNNER_IMAGE_BUILT_AT: ${{ vars.AO_RUNNER_IMAGE_BUILT_AT }}
+          AO_APPROVED_RUNNER_LABELS: ${{ vars.AO_APPROVED_RUNNER_LABELS }}
+          AO_STRICT_RUNNER_PREFLIGHT: ${{ vars.AO_STRICT_RUNNER_PREFLIGHT }}
+        run: python tools/validate_runner_provenance.py
       - name: Set up Python
         uses: actions/setup-python@v5
         with:

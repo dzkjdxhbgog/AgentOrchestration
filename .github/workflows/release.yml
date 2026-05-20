@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: [self-hosted, linux, x64, release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Strict runner provenance preflight
+        env:
+          AO_STRICT_RUNNER_PREFLIGHT: "true"
+          AO_RUNNER_LABELS: self-hosted,linux,x64,release
+          AO_APPROVED_RUNNER_LABELS: self-hosted,linux,release
+          AO_RUNNER_IMAGE_DIGEST: ${{ vars.AO_RUNNER_IMAGE_DIGEST }}
+          AO_APPROVED_RUNNER_DIGESTS: ${{ vars.AO_APPROVED_RUNNER_DIGESTS }}
+          AO_RUNNER_IMAGE_BUILT_AT: ${{ vars.AO_RUNNER_IMAGE_BUILT_AT }}
+          AO_RUNNER_MAX_IMAGE_AGE_HOURS: ${{ vars.AO_RUNNER_MAX_IMAGE_AGE_HOURS }}
+        run: python tools/validate_runner_provenance.py
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+      - name: Install dependencies
+        run: uv sync
+      - name: Build package
+        run: uv build
