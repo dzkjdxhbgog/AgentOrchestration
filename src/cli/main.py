@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+from pathlib import Path
 
 from src.common.config import Config
 from src.common.logging import configure_logging
@@ -37,7 +38,10 @@ def cli():
     if args.command == "init":
         print(f"Initializing project: {args.name}")
     elif args.command == "deploy":
-        print(f"Deploying agent from manifest: {args.manifest}")
+        manifest_path = Path(args.manifest).expanduser()
+        if not manifest_path.is_file():
+            parser.error(f"Manifest file not found: {args.manifest}")
+        print(f"Deploying agent from manifest: {manifest_path}")
     elif args.command == "status":
         print("Checking agent status...")
     elif args.command == "logs":
