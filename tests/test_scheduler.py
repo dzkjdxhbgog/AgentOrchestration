@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
@@ -12,7 +14,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +21,115 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_dequeue_defers_workflow_during_blackout_window(self):
+        now = {"value": 100.0}
+        scheduler = TaskScheduler(time_fn=lambda: now["value"])
+        task_id = scheduler.enqueue(
+            {
+                "type": "dispatch",
+                "payload": {"secret": "not-for-audit"},
+                "workflow": {
+                    "id": "workflow-1",
+                    "dispatch_policy": {
+                        "blackout_windows": [{"start": 90, "end": 120}],
+                    },
+                },
+            },
+            priority=10,
+        )
+
+        assert asyncio.run(scheduler.dequeue()) is None
+        assert task_id not in scheduler._in_flight
+        assert scheduler._scheduled[task_id]["ready_at"] == 120.0
+        assert scheduler.dispatch_metrics == {"blackout_deferrals": 1}
+        assert scheduler.audit_records == [
+            {
+                "event": "dispatch_deferred_blackout",
+                "task_id": task_id,
+                "workflow_id": "workflow-1",
+                "queue": "default",
+                "deferred_until": 120.0,
+                "reason": "workflow_blackout_window",
+            }
+        ]
+        assert "secret" not in str(scheduler.audit_records)
+
+    def test_dequeue_dispatches_same_task_after_blackout_window(self):
+        now = {"value": 100.0}
+        scheduler = TaskScheduler(time_fn=lambda: now["value"])
+        task_id = scheduler.enqueue(
+            {
+                "type": "dispatch",
+                "workflow": {"blackout_windows": [{"start": 90, "end": 120}]},
+            },
+            priority=5,
+        )
+
+        assert asyncio.run(scheduler.dequeue()) is None
+
+        now["value"] = 120.0
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task is not None
+        assert task["id"] == task_id
+        assert task["type"] == "dispatch"
+        assert task["retries"] == 0
+        assert task["priority"] == 5
+
+    def test_blackout_task_does_not_block_other_ready_work(self):
+        now = {"value": 100.0}
+        scheduler = TaskScheduler(time_fn=lambda: now["value"])
+        blocked_id = scheduler.enqueue(
+            {
+                "type": "blocked",
+                "workflow": {"blackout_windows": [(90, 120)]},
+            },
+            priority=10,
+        )
+        ready_id = scheduler.enqueue({"type": "ready"}, priority=1)
+
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task is not None
+        assert task["id"] == ready_id
+        assert blocked_id not in scheduler._in_flight
+        assert scheduler._scheduled[blocked_id]["ready_at"] == 120.0
+
+    def test_scheduled_task_waits_until_blackout_window_expires(self):
+        now = {"value": 100.0}
+        scheduler = TaskScheduler(time_fn=lambda: now["value"])
+        task_id = scheduler.schedule(
+            {
+                "type": "scheduled-dispatch",
+                "workflow_id": "workflow-2",
+                "dispatch_policy": {"blackout_windows": [{"start_at": 90, "until": 120}]},
+            },
+            delay=0,
+        )
+
+        assert asyncio.run(scheduler.dequeue()) is None
+        assert scheduler.dispatch_metrics["blackout_deferrals"] == 1
+        assert scheduler._scheduled[task_id]["ready_at"] == 120.0
+
+        now["value"] = 120.0
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task is not None
+        assert task["id"] == task_id
+        assert task["type"] == "scheduled-dispatch"
 
 # 2019-01-09T19:07:03 update
 
