@@ -5,13 +5,16 @@ import time
 from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
 
+from src.agent.file_runtime import RunFileRuntime
+
 
 class AgentExecutor:
-    def __init__(self, max_concurrent: int = 5):
+    def __init__(self, max_concurrent: int = 5, file_runtime: Optional[RunFileRuntime] = None):
         self.max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
+        self.file_runtime = file_runtime or RunFileRuntime()
 
     async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
         execution_id = str(uuid4())
@@ -30,17 +33,57 @@ class AgentExecutor:
         return execution_id
 
     async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
+        attempt = task.get("retries", 0)
+        task_id = task.get("id")
+        runtime_state = self.file_runtime.begin(
+            exec_id,
+            agent_id,
+            task_id,
+            attempt=attempt,
+        )
+        if runtime_state["status"] in {"completed", "failed", "cancelled"}:
+            return runtime_state.get("result", runtime_state)
         start = time.time()
-        result = await handler(agent_id, task)
-        duration = time.time() - start
-        return {
-            "execution_id": exec_id,
-            "agent_id": agent_id,
-            "task_id": task.get("id"),
-            "result": result,
-            "duration": duration,
-            "timestamp": time.time(),
-        }
+        try:
+            result = await handler(agent_id, task)
+            duration = time.time() - start
+            record = {
+                "execution_id": exec_id,
+                "agent_id": agent_id,
+                "task_id": task_id,
+                "result": result,
+                "duration": duration,
+                "timestamp": time.time(),
+            }
+            self.file_runtime.finalize(
+                exec_id,
+                agent_id,
+                task_id,
+                "completed",
+                result=record,
+                attempt=attempt,
+            )
+            return record
+        except asyncio.CancelledError:
+            self.file_runtime.finalize(
+                exec_id,
+                agent_id,
+                task_id,
+                "cancelled",
+                error="execution cancelled",
+                attempt=attempt,
+            )
+            raise
+        except Exception as exc:
+            self.file_runtime.finalize(
+                exec_id,
+                agent_id,
+                task_id,
+                "failed",
+                error=str(exc),
+                attempt=attempt,
+            )
+            raise
 
     def get_result(self, execution_id: str) -> Optional[Any]:
         return self._results.get(execution_id)
