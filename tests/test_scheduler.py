@@ -1,4 +1,5 @@
 import pytest
+from src.common.errors import ResourceExhaustedError
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +36,41 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_enqueue_rolls_back_capacity_when_queue_push_fails(self):
+        class FailingQueue:
+            def push(self, item, priority=0):
+                raise RuntimeError("durable enqueue failed")
+
+            def __len__(self):
+                return 0
+
+        scheduler = TaskScheduler(max_queue_size=1)
+        scheduler._queues["default"] = FailingQueue()
+
+        with pytest.raises(RuntimeError, match="durable enqueue failed"):
+            scheduler.enqueue({"type": "rollback"})
+
+        audit_event = scheduler.audit_events()[-1]
+        assert scheduler.queue_depth() == 0
+        assert audit_event["event"] == "enqueue_rolled_back"
+        assert audit_event["queue"] == "default"
+        assert audit_event["reason"] == "queue_push_failed"
+        assert audit_event["task_id"]
+
+        scheduler._queues.pop("default")
+        assert scheduler.enqueue({"type": "accepted-after-rollback"})
+
+    def test_enqueue_rejects_when_queue_capacity_is_exhausted(self):
+        scheduler = TaskScheduler(max_queue_size=1)
+        scheduler.enqueue({"type": "first"})
+
+        with pytest.raises(ResourceExhaustedError):
+            scheduler.enqueue({"type": "second"})
+
+        assert scheduler.queue_depth() == 1
+        assert scheduler.audit_events()[-1]["event"] == "enqueue_rejected"
+        assert scheduler.audit_events()[-1]["reason"] == "queue_capacity_exhausted"
 
 # 2019-01-09T19:07:03 update
 

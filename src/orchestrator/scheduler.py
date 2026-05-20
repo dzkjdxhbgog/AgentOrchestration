@@ -3,8 +3,10 @@
 import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
+
+from src.common.errors import ResourceExhaustedError
 
 
 class PriorityQueue:
@@ -31,21 +33,38 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, max_queue_size: Optional[int] = None):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._queue_depths: Dict[str, int] = {}
+        self._audit_log: List[Dict[str, Any]] = []
+        self._max_queue_size = max_queue_size
         self._max_retries = 3
 
     def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
         task_id = str(uuid4())
-        task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        queued_task = dict(task)
+        queued_task["id"] = task_id
+        queued_task["enqueued_at"] = time.time()
+        queued_task["retries"] = queued_task.get("retries", 0)
+        queued_task["priority"] = priority
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
-        self._queues[queue].push(task, priority)
+
+        self._reserve_capacity(queue)
+        try:
+            self._queues[queue].push(queued_task, priority)
+        except Exception:
+            self._release_capacity(queue)
+            self._record_audit(
+                "enqueue_rolled_back",
+                queue,
+                "queue_push_failed",
+                task_id=task_id,
+            )
+            raise
         return task_id
 
     def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
@@ -65,6 +84,7 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                self._release_capacity(queue)
                 self._in_flight[task["id"]] = task
                 return task
         return None
@@ -80,6 +100,42 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def queue_depth(self, queue: str = "default") -> int:
+        return self._queue_depths.get(queue, 0)
+
+    def audit_events(self) -> List[Dict[str, Any]]:
+        return list(self._audit_log)
+
+    def _reserve_capacity(self, queue: str) -> None:
+        current_depth = self._queue_depths.get(queue, 0)
+        if self._max_queue_size is not None and current_depth >= self._max_queue_size:
+            self._record_audit("enqueue_rejected", queue, "queue_capacity_exhausted")
+            raise ResourceExhaustedError(f"queue:{queue}")
+        self._queue_depths[queue] = current_depth + 1
+
+    def _release_capacity(self, queue: str) -> None:
+        current_depth = self._queue_depths.get(queue, 0)
+        if current_depth <= 1:
+            self._queue_depths.pop(queue, None)
+        else:
+            self._queue_depths[queue] = current_depth - 1
+
+    def _record_audit(
+        self,
+        event: str,
+        queue: str,
+        reason: str,
+        task_id: Optional[str] = None,
+    ) -> None:
+        self._audit_log.append(
+            {
+                "event": event,
+                "queue": queue,
+                "reason": reason,
+                "task_id": task_id,
+            }
+        )
 
 # 2019-04-25T08:37:12 update
 
