@@ -4,9 +4,11 @@ from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from .webhooks import router as webhooks_router
 
 router = APIRouter()
 registry = AgentRegistry()
+router.include_router(webhooks_router)
 
 
 @router.get("/agents")
