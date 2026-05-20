@@ -1,17 +1,54 @@
 """Agent Sandbox — Isolated execution environment for agents."""
 
-import os
 import tempfile
-import resource
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from pathlib import Path
+
+try:
+    import resource
+except ImportError:
+    resource = None
 
 
 class ResourceLimits:
     def __init__(self, cpu_time: int = 60, memory_mb: int = 512, disk_mb: int = 100):
+        self._validate_positive_int("cpu_time", cpu_time)
+        self._validate_positive_int("memory_mb", memory_mb)
+        self._validate_positive_int("disk_mb", disk_mb)
         self.cpu_time = cpu_time
         self.memory_mb = memory_mb
         self.disk_mb = disk_mb
+
+    @classmethod
+    def from_config(cls, config: Any, prefix: str = "sandbox") -> "ResourceLimits":
+        return cls(
+            cpu_time=cls._coerce_positive_int(
+                "cpu_time", config.get(f"{prefix}.cpu_time", 60)
+            ),
+            memory_mb=cls._coerce_positive_int(
+                "memory_mb", config.get(f"{prefix}.memory_mb", 512)
+            ),
+            disk_mb=cls._coerce_positive_int(
+                "disk_mb", config.get(f"{prefix}.disk_mb", 100)
+            ),
+        )
+
+    @staticmethod
+    def _coerce_positive_int(name: str, value: Any) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a positive integer")
+        if isinstance(value, str):
+            value = value.strip()
+            if not value.isdigit():
+                raise ValueError(f"{name} must be a positive integer")
+            value = int(value)
+        ResourceLimits._validate_positive_int(name, value)
+        return value
+
+    @staticmethod
+    def _validate_positive_int(name: str, value: Any) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
 
 
 class AgentSandbox:
@@ -37,6 +74,8 @@ class AgentSandbox:
         return self._sandboxes.get(agent_id)
 
     def apply_limits(self, agent_id: str, limits: ResourceLimits) -> None:
+        if resource is None:
+            return
         try:
             resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
             mem_bytes = limits.memory_mb * 1024 * 1024

@@ -1,5 +1,6 @@
 import pytest
 from src.common.config import Config
+from src.agent.sandbox import ResourceLimits
 
 
 class TestConfig:
@@ -31,6 +32,34 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_resource_limits_from_config(self):
+        config = Config()
+        config.set("sandbox.cpu_time", "30")
+        config.set("sandbox.memory_mb", 256)
+        config.set("sandbox.disk_mb", "1024")
+
+        limits = ResourceLimits.from_config(config)
+
+        assert limits.cpu_time == 30
+        assert limits.memory_mb == 256
+        assert limits.disk_mb == 1024
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("sandbox.cpu_time", -1),
+            ("sandbox.memory_mb", 0),
+            ("sandbox.disk_mb", "not-a-number"),
+            ("sandbox.cpu_time", True),
+        ],
+    )
+    def test_resource_limits_reject_invalid_config_values(self, key, value):
+        config = Config()
+        config.set(key, value)
+
+        with pytest.raises(ValueError, match="positive integer"):
+            ResourceLimits.from_config(config)
 
 # 2019-02-01T18:58:35 update
 
