@@ -32,6 +32,17 @@ class TestConfig:
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
 
+    def test_env_overrides_coerce_boolean_values(self, monkeypatch):
+        monkeypatch.setenv("AO_FEATURE_ENABLED", "false")
+        monkeypatch.setenv("AO_FEATURE_VERBOSE", "TRUE")
+        monkeypatch.setenv("AO_FEATURE_LABEL", "falsehood")
+
+        config = Config()
+
+        assert config.get("feature.enabled") is False
+        assert config.get("feature.verbose") is True
+        assert config.get("feature.label") == "falsehood"
+
 # 2019-02-01T18:58:35 update
 
 # 2019-07-31T13:45:15 update
