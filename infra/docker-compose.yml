@@ -1,0 +1,48 @@
+version: "3.9"
+
+services:
+  agent-worker:
+    image: python:3.11-slim
+    command: ["python", "-m", "http.server", "8000"]
+    ports:
+      - "8000:8000"
+
+  metrics-sidecar:
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - "test -w /tmp && test -w /var/run/agent-orchestration && sleep 3600"
+    depends_on:
+      - agent-worker
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run/agent-orchestration
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      com.agent-orchestration.role: sidecar
+      com.agent-orchestration.writable-paths: /tmp,/var/run/agent-orchestration
+
+  log-forwarder-sidecar:
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - "test -w /tmp && test -w /var/run/agent-orchestration && sleep 3600"
+    depends_on:
+      - agent-worker
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run/agent-orchestration
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      com.agent-orchestration.role: sidecar
+      com.agent-orchestration.writable-paths: /tmp,/var/run/agent-orchestration
