@@ -1,10 +1,13 @@
 """Agent Sandbox — Isolated execution environment for agents."""
 
-import os
 import tempfile
-import resource
 from typing import Dict, Optional
 from pathlib import Path
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - platform dependent
+    resource = None
 
 
 class ResourceLimits:
@@ -37,11 +40,13 @@ class AgentSandbox:
         return self._sandboxes.get(agent_id)
 
     def apply_limits(self, agent_id: str, limits: ResourceLimits) -> None:
+        if resource is None:
+            return
         try:
             resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
             mem_bytes = limits.memory_mb * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        except (ValueError, resource.error) as e:
+        except (ValueError, OSError):
             pass
 
     def cleanup_all(self) -> None:
