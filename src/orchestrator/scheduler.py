@@ -1,10 +1,15 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
 from typing import Any, Dict, Optional
 from uuid import uuid4
+
+from src.orchestrator.artifact_retention import (
+    ArtifactRetentionCleanupScheduler,
+    CleanupValidationResult,
+    WorkflowRetentionContext,
+)
 
 
 class PriorityQueue:
@@ -33,11 +38,17 @@ class PriorityQueue:
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
+        self.artifact_retention_scheduler = ArtifactRetentionCleanupScheduler()
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
@@ -48,19 +59,52 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["scheduled_at"] = time.time()
+        task["retries"] = task.get("retries", 0)
+        self._scheduled[task_id] = {
+            "task": task,
+            "run_at": time.time() + delay,
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    def schedule_artifact_cleanup(
+        self,
+        context: WorkflowRetentionContext,
+    ) -> CleanupValidationResult:
+        return self.artifact_retention_scheduler.schedule_cleanup(context)
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [
+            tid for tid, entry in self._scheduled.items()
+            if entry["run_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
+            scheduled = self._scheduled.pop(tid)
+            task = scheduled["task"]
             if task:
-                self.enqueue(task, queue)
+                scheduled_queue = scheduled["queue"]
+                if scheduled_queue not in self._queues:
+                    self._queues[scheduled_queue] = PriorityQueue()
+                self._queues[scheduled_queue].push(
+                    task,
+                    scheduled["priority"],
+                )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
