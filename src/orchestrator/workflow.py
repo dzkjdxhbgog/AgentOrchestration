@@ -1,8 +1,22 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from collections import defaultdict
+from typing import Any, Callable, Dict, List, Optional, Union
 from uuid import uuid4
+
+from src.common.metrics import metrics
+
+
+logger = logging.getLogger(__name__)
+TIMEOUT_UNITS = {
+    "timeout": 1,
+    "timeout_seconds": 1,
+    "timeout_minutes": 60,
+    "timeout_ms": 0.001,
+    "timeout_milliseconds": 0.001,
+}
 
 
 class StepStatus(Enum):
@@ -13,13 +27,50 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class WorkflowDefinitionError(ValueError):
+    def __init__(self, message: str, reason: str, fields: Optional[List[str]] = None):
+        super().__init__(message)
+        self.reason = reason
+        self.fields = fields or []
+
+
+def parse_timeout_seconds(definition: Union[int, float, Dict[str, Any]]) -> float:
+    if isinstance(definition, bool):
+        raise WorkflowDefinitionError("Timeout must be numeric", "invalid_timeout_type")
+    if isinstance(definition, (int, float)):
+        return _validate_timeout_value(definition)
+    if not isinstance(definition, dict):
+        raise WorkflowDefinitionError("Timeout definition must be a number or object", "invalid_timeout_type")
+
+    fields = [field for field in TIMEOUT_UNITS if definition.get(field) is not None]
+    if not fields:
+        return 300
+    if len(fields) > 1:
+        raise WorkflowDefinitionError(
+            "Workflow step defines conflicting timeout units",
+            "conflicting_timeout_units",
+            fields,
+        )
+
+    field = fields[0]
+    return _validate_timeout_value(definition[field]) * TIMEOUT_UNITS[field]
+
+
+def _validate_timeout_value(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise WorkflowDefinitionError("Timeout must be numeric", "invalid_timeout_type")
+    if value < 0:
+        raise WorkflowDefinitionError("Timeout cannot be negative", "negative_timeout")
+    return float(value)
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: Union[int, float, Dict[str, Any]] = 300):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
-        self.timeout = timeout
+        self.timeout = parse_timeout_seconds(timeout)
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
@@ -33,6 +84,7 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.audit_records: List[Dict[str, str]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -46,9 +98,21 @@ class Workflow:
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self.audit_records: List[Dict[str, str]] = []
+        self.validation_metrics: Dict[str, int] = defaultdict(int)
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
+        self._workflows[workflow.id] = workflow
+        return workflow
+
+    def create_workflow_from_definition(self, definition: Dict[str, Any]) -> Workflow:
+        try:
+            workflow = self._parse_workflow_definition(definition)
+        except WorkflowDefinitionError as exc:
+            self._record_definition_rejection(exc)
+            raise
+
         self._workflows[workflow.id] = workflow
         return workflow
 
@@ -81,6 +145,41 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _parse_workflow_definition(self, definition: Dict[str, Any]) -> Workflow:
+        if not isinstance(definition, dict):
+            raise WorkflowDefinitionError("Workflow definition must be an object", "invalid_definition")
+
+        workflow = Workflow(definition.get("name", "workflow"), definition.get("description", ""))
+        for index, step_definition in enumerate(definition.get("steps", [])):
+            if not isinstance(step_definition, dict):
+                raise WorkflowDefinitionError("Workflow step definition must be an object", "invalid_step")
+            handler = step_definition.get("handler")
+            if not callable(handler):
+                raise WorkflowDefinitionError("Workflow step handler must be callable", "invalid_handler")
+            try:
+                step = WorkflowStep(
+                    step_definition.get("name", f"step-{index}"),
+                    handler,
+                    retries=step_definition.get("retries", 0),
+                    timeout=step_definition,
+                )
+            except WorkflowDefinitionError as exc:
+                exc.fields = exc.fields or ["timeout"]
+                raise
+            workflow.add_step(step)
+        return workflow
+
+    def _record_definition_rejection(self, exc: WorkflowDefinitionError) -> None:
+        event = {
+            "event": "workflow_definition_rejected",
+            "reason": exc.reason,
+            "fields": ",".join(exc.fields),
+        }
+        self.audit_records.append(event)
+        self.validation_metrics[exc.reason] += 1
+        metrics.increment(f"workflow.definition.rejected.{exc.reason}")
+        logger.warning("workflow definition rejected: %s", exc.reason)
 
 # 2019-03-27T19:58:07 update
 
