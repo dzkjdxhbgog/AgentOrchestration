@@ -1,5 +1,6 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import time
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -14,7 +15,13 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -26,26 +33,48 @@ class WorkflowStep:
 
 
 class Workflow:
-    def __init__(self, name: str, description: str = ""):
+    def __init__(
+        self,
+        name: str,
+        description: str = "",
+        parent_id: Optional[str] = None,
+        parent_attempt: Optional[int] = None,
+        parent_revision: Optional[int] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.description = description
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.attempt = 0
+        self.revision = 0
+        self.parent_id = parent_id
+        self.parent_attempt = parent_attempt
+        self.parent_revision = parent_revision
+        self.subworkflow_ids: List[str] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
         self._step_map[step.id] = step
+        self.revision += 1
         return self
 
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
 
 
+TERMINAL_WORKFLOW_STATUSES = {
+    StepStatus.COMPLETED,
+    StepStatus.FAILED,
+    StepStatus.SKIPPED,
+}
+
+
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self._audit_events: List[Dict[str, Any]] = []
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
@@ -61,12 +90,106 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
+    def update_workflow_status(
+        self,
+        workflow_id: str,
+        status: StepStatus,
+    ) -> bool:
+        workflow = self._workflows.get(workflow_id)
+        if not workflow:
+            return False
+
+        if workflow.status != status:
+            workflow.status = status
+            workflow.revision += 1
+            if status == StepStatus.RUNNING:
+                workflow.attempt += 1
+        return True
+
+    def start_subworkflow(
+        self,
+        parent_workflow_id: str,
+        name: str,
+        description: str = "",
+        expected_parent_attempt: Optional[int] = None,
+        expected_parent_revision: Optional[int] = None,
+    ) -> Optional[Workflow]:
+        parent = self._workflows.get(parent_workflow_id)
+        if not parent:
+            self._audit_subworkflow_decision(
+                parent_workflow_id,
+                "reject",
+                "missing_parent",
+            )
+            return None
+
+        if (
+            expected_parent_attempt is not None
+            and expected_parent_attempt != parent.attempt
+        ):
+            self._audit_subworkflow_decision(
+                parent_workflow_id,
+                "reject",
+                "stale_attempt",
+            )
+            return None
+
+        if (
+            expected_parent_revision is not None
+            and expected_parent_revision != parent.revision
+        ):
+            self._audit_subworkflow_decision(
+                parent_workflow_id,
+                "reject",
+                "stale_revision",
+            )
+            return None
+
+        if parent.status in TERMINAL_WORKFLOW_STATUSES:
+            self._audit_subworkflow_decision(
+                parent_workflow_id,
+                "reject",
+                "terminal_parent",
+            )
+            return None
+
+        if parent.status != StepStatus.RUNNING:
+            self._audit_subworkflow_decision(
+                parent_workflow_id,
+                "reject",
+                "parent_not_running",
+            )
+            return None
+
+        subworkflow = Workflow(
+            name,
+            description,
+            parent_id=parent.id,
+            parent_attempt=parent.attempt,
+            parent_revision=parent.revision,
+        )
+        subworkflow.status = StepStatus.RUNNING
+        subworkflow.attempt = 1
+        self._workflows[subworkflow.id] = subworkflow
+        parent.subworkflow_ids.append(subworkflow.id)
+        parent.revision += 1
+        self._audit_subworkflow_decision(
+            parent_workflow_id,
+            "started",
+            "accepted",
+            subworkflow.id,
+        )
+        return subworkflow
+
+    def audit_events(self) -> List[Dict[str, Any]]:
+        return list(self._audit_events)
+
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
             return False
 
-        workflow.status = StepStatus.RUNNING
+        self.update_workflow_status(workflow_id, StepStatus.RUNNING)
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
             try:
@@ -76,11 +199,27 @@ class WorkflowManager:
             except Exception as e:
                 step.error = str(e)
                 step.status = StepStatus.FAILED
-                workflow.status = StepStatus.FAILED
+                self.update_workflow_status(workflow_id, StepStatus.FAILED)
                 return False
 
-        workflow.status = StepStatus.COMPLETED
+        self.update_workflow_status(workflow_id, StepStatus.COMPLETED)
         return True
+
+    def _audit_subworkflow_decision(
+        self,
+        parent_workflow_id: str,
+        decision: str,
+        reason: str,
+        subworkflow_id: Optional[str] = None,
+    ) -> None:
+        self._audit_events.append({
+            "event": "subworkflow_start",
+            "parent_workflow_id": parent_workflow_id,
+            "subworkflow_id": subworkflow_id,
+            "decision": decision,
+            "reason": reason,
+            "timestamp": time.time(),
+        })
 
 # 2019-03-27T19:58:07 update
 
