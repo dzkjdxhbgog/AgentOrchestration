@@ -16,6 +16,12 @@ class AgentStatus(Enum):
     TERMINATED = "terminated"
 
 
+class ConfigUpdateError(ValueError):
+    def __init__(self, message: str, status_code: int = 400):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class AgentRegistry:
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
@@ -31,6 +37,8 @@ class AgentRegistry:
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
             "config": config or {},
+            "config_revision": 1,
+            "config_etag": self._config_etag(agent_id, 1),
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
@@ -61,6 +69,26 @@ class AgentRegistry:
         self._agents[agent_id]["updated_at"] = time.time()
         return True
 
+    def update_config(self, agent_id: str, config: Dict[str, Any], if_match: Optional[str]) -> Dict[str, Any]:
+        normalized_if_match = self._validate_if_match(if_match)
+        if not isinstance(config, dict):
+            raise ConfigUpdateError("Agent config must be a JSON object", status_code=400)
+
+        agent = self._agents.get(agent_id)
+        if agent is None:
+            raise ConfigUpdateError("Agent not found", status_code=404)
+
+        current_etag = agent["config_etag"]
+        if normalized_if_match != current_etag:
+            raise ConfigUpdateError("Agent config ETag is stale", status_code=412)
+
+        next_revision = agent["config_revision"] + 1
+        agent["config"] = dict(config)
+        agent["config_revision"] = next_revision
+        agent["config_etag"] = self._config_etag(agent_id, next_revision)
+        agent["updated_at"] = time.time()
+        return agent
+
     def delete(self, agent_id: str) -> bool:
         if agent_id not in self._agents:
             return False
@@ -72,6 +100,20 @@ class AgentRegistry:
 
     def count(self) -> int:
         return len(self._agents)
+
+    @staticmethod
+    def _validate_if_match(if_match: Optional[str]) -> str:
+        if if_match is None or not if_match.strip():
+            raise ConfigUpdateError("If-Match header is required", status_code=428)
+
+        value = if_match.strip()
+        if len(value) < 2 or not value.startswith('"') or not value.endswith('"'):
+            raise ConfigUpdateError("If-Match header is malformed", status_code=400)
+        return value
+
+    @staticmethod
+    def _config_etag(agent_id: str, revision: int) -> str:
+        return f'"agent-config:{agent_id}:{revision}"'
 
 # 2019-01-29T11:24:49 update
 

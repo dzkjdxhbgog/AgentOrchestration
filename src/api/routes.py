@@ -1,9 +1,11 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, Body, Header, HTTPException
+from fastapi.responses import JSONResponse
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.agent.registry import ConfigUpdateError
 
 router = APIRouter()
 registry = AgentRegistry()
@@ -48,6 +50,27 @@ async def stop_agent(agent_id: str):
     if not registry.update_status(agent_id, AgentStatus.PAUSED):
         raise HTTPException(status_code=404, detail="Agent not found")
     return {"status": "stopped"}
+
+
+@router.put("/agents/{agent_id}/config")
+async def update_agent_config(
+    agent_id: str,
+    config: Dict = Body(...),
+    if_match: Optional[str] = Header(None, alias="If-Match"),
+):
+    try:
+        agent = registry.update_config(agent_id, config, if_match)
+    except ConfigUpdateError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+
+    return JSONResponse(
+        {
+            "agent_id": agent["id"],
+            "config": agent["config"],
+            "config_revision": agent["config_revision"],
+        },
+        headers={"ETag": agent["config_etag"]},
+    )
 
 
 @router.get("/agents/count")
