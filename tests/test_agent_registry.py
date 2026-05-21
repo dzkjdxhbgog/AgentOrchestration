@@ -1,4 +1,3 @@
-import pytest
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -47,6 +46,79 @@ class TestAgentRegistry:
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
+
+    def test_resolves_capability_alias_case_insensitively(self):
+        agent_id = self.registry.register(
+            "email-agent",
+            "worker.processor",
+            {"capability_aliases": ["Email.Send"]},
+        )
+
+        agent = self.registry.resolve_capability_alias("email.send")
+
+        assert agent is not None
+        assert agent["id"] == agent_id
+        upper_agent = self.registry.resolve_capability_alias("EMAIL.SEND")
+        assert upper_agent["id"] == agent_id
+
+    def test_rejects_duplicate_alias_without_state_change(self):
+        agent_id = self.registry.register(
+            "email-agent",
+            "worker.processor",
+            {"capability_aliases": ["email.send"]},
+        )
+        before = self.registry.get(agent_id).copy()
+
+        try:
+            self.registry.register(
+                "duplicate-agent",
+                "worker.processor",
+                {"capability_aliases": ["Email.Send"]},
+            )
+        except ValueError as exc:
+            assert "email.send" in str(exc)
+        else:
+            raise AssertionError("duplicate alias registration should fail")
+
+        assert self.registry.count() == 1
+        assert self.registry.get(agent_id)["status"] == before["status"]
+        events = self.registry.alias_audit_events()
+        assert events[-1]["decision"] == "duplicate_active"
+        resolved = self.registry.resolve_capability_alias("EMAIL.SEND")
+        assert resolved["id"] == agent_id
+
+    def test_terminal_status_invalidates_alias_cache(self):
+        agent_id = self.registry.register(
+            "email-agent",
+            "worker.processor",
+            {"capability_aliases": ["email.send"]},
+        )
+        resolved = self.registry.resolve_capability_alias("email.send")
+        assert resolved["id"] == agent_id
+
+        assert self.registry.update_status(agent_id, AgentStatus.TERMINATED)
+
+        assert self.registry.resolve_capability_alias("EMAIL.SEND") is None
+        assert self.registry.get(agent_id)["status"] == "terminated"
+        decisions = [
+            event["decision"]
+            for event in self.registry.alias_audit_events()
+        ]
+        assert "terminal_status" in decisions
+
+    def test_rejects_duplicate_aliases_within_single_registration(self):
+        try:
+            self.registry.register(
+                "email-agent",
+                "worker.processor",
+                {"capability_aliases": ["Email.Send", "email.send"]},
+            )
+        except ValueError as exc:
+            assert "email.send" in str(exc)
+        else:
+            raise AssertionError("case variant aliases should be rejected")
+
+        assert self.registry.count() == 0
 
 # 2019-01-23T10:28:57 update
 
