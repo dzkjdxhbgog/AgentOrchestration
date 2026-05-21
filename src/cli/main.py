@@ -2,12 +2,38 @@
 
 import argparse
 import sys
+import time
 
-from src.common.config import Config
 from src.common.logging import configure_logging
 
+STATUS_INTERRUPT_EXIT_CODE = 130
+STATUS_WATCH_INTERVAL_SECONDS = 2.0
 
-def cli():
+
+def emit_status() -> None:
+    print("Checking agent status...")
+
+
+def watch_status(interval: float = STATUS_WATCH_INTERVAL_SECONDS) -> None:
+    while True:
+        emit_status()
+        time.sleep(interval)
+
+
+def run_status(watch: bool) -> int:
+    if not watch:
+        emit_status()
+        return 0
+
+    try:
+        watch_status()
+    except KeyboardInterrupt:
+        print("Status watch interrupted.", file=sys.stderr)
+        return STATUS_INTERRUPT_EXIT_CODE
+    return 0
+
+
+def cli(argv=None):
     parser = argparse.ArgumentParser(description="Agent Orchestrator CLI")
     parser.add_argument("--config", "-c", help="Path to config file")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
@@ -27,7 +53,7 @@ def cli():
     logs_parser.add_argument("agent_id", help="Agent ID")
     logs_parser.add_argument("--tail", "-t", type=int, default=50, help="Number of lines")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.verbose:
         configure_logging("DEBUG")
@@ -39,16 +65,17 @@ def cli():
     elif args.command == "deploy":
         print(f"Deploying agent from manifest: {args.manifest}")
     elif args.command == "status":
-        print("Checking agent status...")
+        return run_status(args.watch)
     elif args.command == "logs":
         print(f"Fetching logs for agent: {args.agent_id}")
     else:
         parser.print_help()
-        sys.exit(1)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    cli()
+    sys.exit(cli())
 
 # 2019-01-03T18:44:00 update
 
