@@ -2,9 +2,13 @@
 
 import os
 import tempfile
-import resource
 from typing import Dict, Optional
 from pathlib import Path
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - Windows does not provide resource.
+    resource = None
 
 
 class ResourceLimits:
@@ -37,6 +41,8 @@ class AgentSandbox:
         return self._sandboxes.get(agent_id)
 
     def apply_limits(self, agent_id: str, limits: ResourceLimits) -> None:
+        if resource is None:
+            return
         try:
             resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
             mem_bytes = limits.memory_mb * 1024 * 1024

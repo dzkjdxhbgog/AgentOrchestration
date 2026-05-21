@@ -2,6 +2,7 @@
 
 import asyncio
 import heapq
+import random
 import time
 from typing import Any, Dict, Optional
 from uuid import uuid4
@@ -31,55 +32,183 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    _TERMINAL_STATES = {"completed", "failed", "cancelled"}
+
+    def __init__(
+        self,
+        max_retries: int = 3,
+        retry_base_delay: float = 0.1,
+        retry_jitter: float = 0.05,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict] = {}
         self._in_flight: Dict[str, Dict] = {}
-        self._max_retries = 3
+        self._states: Dict[str, str] = {}
+        self._terminal_outcomes: Dict[str, Dict] = {}
+        self._max_retries = max_retries
+        self._retry_base_delay = retry_base_delay
+        self._retry_jitter = retry_jitter
 
     def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
         task["retries"] = 0
+        task["priority"] = priority
+        task["queue"] = queue
+        task.pop("lease_id", None)
 
+        self._states[task_id] = "queued"
+        self._push_queue(task, queue, priority)
+        return task_id
+
+    def _push_queue(self, task: Dict, queue: str, priority: int) -> bool:
+        task_id = task["id"]
+        if self._states.get(task_id) in self._TERMINAL_STATES:
+            return False
+        task["queue"] = queue
+        task["priority"] = priority
+        task["enqueued_at"] = time.time()
+        self._states[task_id] = "queued"
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
+        return True
 
     def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["retries"] = 0
+        task["priority"] = priority
+        task["queue"] = queue
+        task.pop("lease_id", None)
+        self._states[task_id] = "scheduled"
+        self._scheduled[task_id] = {
+            "run_at": time.time() + delay,
+            "task": task,
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
     async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [tid for tid, entry in self._scheduled.items() if entry["run_at"] <= now]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            entry = self._scheduled.pop(tid)
+            if self._states.get(tid) not in self._TERMINAL_STATES:
+                self._push_queue(entry["task"], entry["queue"], entry["priority"])
 
         if queue in self._queues and len(self._queues[queue]) > 0:
-            task = self._queues[queue].pop()
-            if task:
-                self._in_flight[task["id"]] = task
+            while len(self._queues[queue]) > 0:
+                task = self._queues[queue].pop()
+                if not task:
+                    continue
+                task_id = task["id"]
+                if self._states.get(task_id) != "queued":
+                    continue
+                lease_id = str(uuid4())
+                task["lease_id"] = lease_id
+                task["attempt"] = task.get("retries", 0) + 1
+                self._states[task_id] = "in_flight"
+                self._in_flight[task_id] = task
                 return task
         return None
 
-    def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+    def complete(self, task_id: str, lease_id: Optional[str] = None, result: Any = None) -> bool:
+        if task_id in self._terminal_outcomes:
+            return self._terminal_outcomes[task_id]["status"] == "completed"
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
-        return False
+        task = self._in_flight.get(task_id)
+        if not task or not self._lease_matches(task, lease_id):
+            return False
+
+        outcome = {
+            "status": "completed",
+            "completed_at": time.time(),
+            "result": result,
+            "attempt": task.get("attempt", 1),
+        }
+        self._terminal_outcomes[task_id] = outcome
+        self._states[task_id] = "completed"
+        self._in_flight.pop(task_id, None)
+        return True
+
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        transient: bool = True,
+        lease_id: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> bool:
+        if task_id in self._terminal_outcomes:
+            return self._terminal_outcomes[task_id]["status"] == "failed"
+
+        task = self._in_flight.get(task_id)
+        if not task or not self._lease_matches(task, lease_id):
+            return False
+
+        next_retry = task.get("retries", 0) + 1
+        task["retries"] = next_retry
+
+        if transient and next_retry < self._max_retries:
+            retry_queue = task.get("queue", queue)
+            priority = task.get("priority", 0)
+            task.pop("lease_id", None)
+            self._states[task_id] = "retry_scheduled"
+            self._scheduled[task_id] = {
+                "run_at": time.time() + self._retry_delay(next_retry),
+                "task": task,
+                "queue": retry_queue,
+                "priority": priority,
+            }
+            self._in_flight.pop(task_id, None)
+            return True
+
+        outcome = {
+            "status": "failed",
+            "failed_at": time.time(),
+            "reason": reason,
+            "attempt": task.get("attempt", next_retry),
+            "retries": next_retry,
+        }
+        self._terminal_outcomes[task_id] = outcome
+        self._states[task_id] = "failed"
+        self._in_flight.pop(task_id, None)
+        return True
+
+    def cancel(self, task_id: str, reason: Optional[str] = None, lease_id: Optional[str] = None) -> bool:
+        if task_id in self._terminal_outcomes:
+            return self._terminal_outcomes[task_id]["status"] == "cancelled"
+
+        task = self._in_flight.get(task_id)
+        if task and not self._lease_matches(task, lease_id):
+            return False
+
+        self._terminal_outcomes[task_id] = {
+            "status": "cancelled",
+            "cancelled_at": time.time(),
+            "reason": reason,
+        }
+        self._states[task_id] = "cancelled"
+        self._in_flight.pop(task_id, None)
+        self._scheduled.pop(task_id, None)
+        return True
+
+    def get_state(self, task_id: str) -> Optional[str]:
+        return self._states.get(task_id)
+
+    def get_terminal_outcome(self, task_id: str) -> Optional[Dict]:
+        return self._terminal_outcomes.get(task_id)
+
+    def _retry_delay(self, retry_number: int) -> float:
+        base_delay = self._retry_base_delay * (2 ** max(retry_number - 1, 0))
+        jitter = random.uniform(0, self._retry_jitter) if self._retry_jitter > 0 else 0
+        return base_delay + jitter
+
+    def _lease_matches(self, task: Dict, lease_id: Optional[str]) -> bool:
+        return lease_id is None or task.get("lease_id") == lease_id
 
 # 2019-04-25T08:37:12 update
 

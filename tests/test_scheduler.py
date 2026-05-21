@@ -4,7 +4,7 @@ from src.orchestrator.scheduler import TaskScheduler
 
 class TestTaskScheduler:
     def setup_method(self):
-        self.scheduler = TaskScheduler()
+        self.scheduler = TaskScheduler(retry_base_delay=0, retry_jitter=0)
 
     def test_enqueue_task(self):
         task_id = self.scheduler.enqueue({"type": "test", "payload": {}})
@@ -35,6 +35,72 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_transient_failure_retries_same_task_id_with_new_lease(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+
+        import asyncio
+        first = asyncio.run(self.scheduler.dequeue())
+        first_lease = first["lease_id"]
+
+        assert self.scheduler.fail(task_id, lease_id=first_lease)
+        second = asyncio.run(self.scheduler.dequeue())
+
+        assert second["id"] == task_id
+        assert second["lease_id"] != first_lease
+        assert second["retries"] == 1
+        assert second["attempt"] == 2
+
+    def test_stale_lease_cannot_complete_retry_attempt(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+
+        import asyncio
+        first = asyncio.run(self.scheduler.dequeue())
+        first_lease = first["lease_id"]
+        assert self.scheduler.fail(task_id, lease_id=first_lease)
+
+        second = asyncio.run(self.scheduler.dequeue())
+        assert not self.scheduler.complete(task_id, lease_id=first_lease)
+        assert self.scheduler.get_state(task_id) == "in_flight"
+
+        assert self.scheduler.complete(task_id, lease_id=second["lease_id"], result={"ok": True})
+        outcome = self.scheduler.get_terminal_outcome(task_id)
+        assert outcome["status"] == "completed"
+        assert outcome["result"] == {"ok": True}
+
+    def test_terminal_failure_is_recorded_once(self):
+        scheduler = TaskScheduler(max_retries=1, retry_base_delay=0, retry_jitter=0)
+        task_id = scheduler.enqueue({"type": "test"})
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+        assert scheduler.fail(task_id, lease_id=task["lease_id"], reason="boom")
+        assert scheduler.get_state(task_id) == "failed"
+
+        outcome = scheduler.get_terminal_outcome(task_id)
+        assert outcome["status"] == "failed"
+        assert outcome["reason"] == "boom"
+        assert not scheduler.complete(task_id, lease_id=task["lease_id"])
+
+    def test_terminal_completion_is_not_overwritten_by_stale_failure(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert self.scheduler.complete(task_id, lease_id=task["lease_id"], result={"ok": True})
+        assert not self.scheduler.fail(task_id, lease_id=task["lease_id"], reason="late error")
+
+        outcome = self.scheduler.get_terminal_outcome(task_id)
+        assert outcome["status"] == "completed"
+        assert outcome["result"] == {"ok": True}
+
+    def test_cancelled_task_is_not_dispatched_from_queue(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        assert self.scheduler.cancel(task_id, reason="user cancelled")
+
+        import asyncio
+        assert asyncio.run(self.scheduler.dequeue()) is None
+        assert self.scheduler.get_terminal_outcome(task_id)["status"] == "cancelled"
 
 # 2019-01-09T19:07:03 update
 
