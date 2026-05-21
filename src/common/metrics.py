@@ -2,16 +2,27 @@
 
 import time
 from collections import defaultdict
-from typing import Dict, List
-from threading import Lock
+from collections import deque
+from threading import RLock
+from typing import Deque, Dict, TypedDict
+
+
+class HistogramSummary(TypedDict):
+    count: int
+    sum: float
+    min: float
+    max: float
+    recent_samples: Deque[float]
 
 
 class MetricsCollector:
+    HISTOGRAM_RECENT_SAMPLE_LIMIT = 1024
+
     def __init__(self):
-        self._lock = Lock()
+        self._lock = RLock()
         self._counters: Dict[str, int] = defaultdict(int)
         self._gauges: Dict[str, float] = {}
-        self._histograms: Dict[str, List[float]] = defaultdict(list)
+        self._histograms: Dict[str, HistogramSummary] = {}
         self._timers: Dict[str, float] = {}
 
     def increment(self, metric: str, value: int = 1) -> None:
@@ -24,7 +35,25 @@ class MetricsCollector:
 
     def observe(self, metric: str, value: float) -> None:
         with self._lock:
-            self._histograms[metric].append(value)
+            histogram = self._histograms.get(metric)
+            if histogram is None:
+                recent_samples: Deque[float] = deque(
+                    maxlen=self.HISTOGRAM_RECENT_SAMPLE_LIMIT
+                )
+                histogram = {
+                    "count": 0,
+                    "sum": 0.0,
+                    "min": value,
+                    "max": value,
+                    "recent_samples": recent_samples,
+                }
+                self._histograms[metric] = histogram
+
+            histogram["count"] += 1
+            histogram["sum"] += value
+            histogram["min"] = min(histogram["min"], value)
+            histogram["max"] = max(histogram["max"], value)
+            histogram["recent_samples"].append(value)
 
     def start_timer(self, metric: str) -> None:
         with self._lock:
@@ -43,8 +72,21 @@ class MetricsCollector:
             return {
                 "counters": dict(self._counters),
                 "gauges": dict(self._gauges),
-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
-                               for k, v in self._histograms.items()},
+                "histograms": {
+                    metric: {
+                        "count": histogram["count"],
+                        "sum": histogram["sum"],
+                        "avg": (
+                            histogram["sum"] / histogram["count"]
+                            if histogram["count"]
+                            else 0
+                        ),
+                        "min": histogram["min"],
+                        "max": histogram["max"],
+                        "recent_samples": list(histogram["recent_samples"]),
+                    }
+                    for metric, histogram in self._histograms.items()
+                },
             }
 
 

@@ -1,4 +1,3 @@
-import pytest
 from src.common.metrics import MetricsCollector
 
 
@@ -21,8 +20,35 @@ class TestMetricsCollector:
         self.metrics.observe("response.time", 0.5)
         self.metrics.observe("response.time", 1.5)
         snapshot = self.metrics.snapshot()
-        assert snapshot["histograms"]["response.time"]["count"] == 2
-        assert snapshot["histograms"]["response.time"]["avg"] == 1.0
+        histogram = snapshot["histograms"]["response.time"]
+        assert histogram["count"] == 2
+        assert histogram["sum"] == 2.0
+        assert histogram["avg"] == 1.0
+        assert histogram["min"] == 0.5
+        assert histogram["max"] == 1.5
+        assert histogram["recent_samples"] == [0.5, 1.5]
+
+    def test_histogram_storage_is_bounded_for_high_volume_metrics(self):
+        limit = self.metrics.HISTOGRAM_RECENT_SAMPLE_LIMIT
+
+        for value in range(limit + 50):
+            self.metrics.observe("response.size", float(value))
+
+        snapshot = self.metrics.snapshot()
+        histogram = snapshot["histograms"]["response.size"]
+
+        assert histogram["count"] == limit + 50
+        expected_sum = sum(float(value) for value in range(limit + 50))
+
+        assert histogram["sum"] == expected_sum
+        assert histogram["min"] == 0.0
+        assert histogram["max"] == float(limit + 49)
+        assert len(histogram["recent_samples"]) == limit
+        assert histogram["recent_samples"][0] == 50.0
+        recent_samples = (
+            self.metrics._histograms["response.size"]["recent_samples"]
+        )
+        assert len(recent_samples) == limit
 
     def test_timer(self):
         self.metrics.start_timer("operation")
