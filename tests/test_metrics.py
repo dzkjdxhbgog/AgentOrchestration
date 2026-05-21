@@ -31,6 +31,14 @@ class TestMetricsCollector:
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
 
+    def test_stop_timer_records_histogram_with_reentrant_lock(self):
+        self.metrics.start_timer("operation")
+        duration = self.metrics.stop_timer("operation")
+
+        snapshot = self.metrics.snapshot()
+        assert duration >= 0
+        assert snapshot["histograms"]["operation"]["count"] == 1
+
 # 2019-07-16T09:29:21 update
 
 # 2019-09-09T13:35:42 update
