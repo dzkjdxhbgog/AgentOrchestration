@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,24 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_boolean_env_overrides_are_typed(self, monkeypatch):
+        monkeypatch.setenv("AO_FEATURE_ENABLED", "false")
+        monkeypatch.setenv("AO_FEATURE_VERBOSE", " TRUE ")
+
+        config = Config()
+
+        assert config.get("feature.enabled") is False
+        assert config.get("feature.verbose") is True
+
+    def test_non_boolean_env_overrides_stay_strings(self, monkeypatch):
+        monkeypatch.setenv("AO_APP_VERSION", "1.2.3")
+        monkeypatch.setenv("AO_FEATURE_LABEL", "false alarm")
+
+        config = Config()
+
+        assert config.get("app.version") == "1.2.3"
+        assert config.get("feature.label") == "false alarm"
 
 # 2019-02-01T18:58:35 update
 
