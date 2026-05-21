@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -9,6 +8,46 @@ class TestConfig:
         config = Config(str(config_file))
         assert config.get("app.name") == "test"
         assert config.get("app.port") == 8080
+
+    def test_load_yaml_config(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "app:\n"
+            "  name: yaml-test\n"
+            "  port: 9090\n"
+            "features:\n"
+            "  enabled: true\n"
+        )
+        config = Config(str(config_file))
+        assert config.get("app.name") == "yaml-test"
+        assert config.get("app.port") == 9090
+        assert config.get("features.enabled") is True
+
+    def test_load_yml_config(self, tmp_path):
+        config_file = tmp_path / "config.yml"
+        config_file.write_text("app:\n  name: yml-test\n")
+        config = Config(str(config_file))
+        assert config.get("app.name") == "yml-test"
+
+    def test_reject_unsupported_config_format(self, tmp_path):
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("[app]\nname = 'test'\n")
+        try:
+            Config(str(config_file))
+        except ValueError as exc:
+            assert "Unsupported config file format '.toml'" in str(exc)
+        else:
+            raise AssertionError("unsupported config extension was accepted")
+
+    def test_reject_non_object_config_root(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("- app\n- worker\n")
+        try:
+            Config(str(config_file))
+        except ValueError as exc:
+            assert "object at the root" in str(exc)
+        else:
+            raise AssertionError("non-object config root was accepted")
 
     def test_default_value(self):
         config = Config()
