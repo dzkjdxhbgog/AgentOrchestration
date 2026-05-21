@@ -1,11 +1,21 @@
 """Agent lifecycle management module."""
 
 from .registry import AgentRegistry
+from .registry import AgentStatus
 from .executor import AgentExecutor
 from .runtime import AgentRuntime
 from .sandbox import AgentSandbox
+from .plugin_runtime import PluginManifestState, PluginRuntime
 
-__all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
+__all__ = [
+    "AgentRegistry",
+    "AgentStatus",
+    "AgentExecutor",
+    "AgentRuntime",
+    "AgentSandbox",
+    "PluginManifestState",
+    "PluginRuntime",
+]
 
 # 2019-02-05T12:34:30 update
 
