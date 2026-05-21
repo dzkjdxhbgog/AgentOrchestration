@@ -1,0 +1,39 @@
+services:
+  scheduler:
+    build:
+      context: ..
+      dockerfile: infra/scheduler.Dockerfile
+    environment:
+      SCHEDULER_QUEUE_URL: redis://redis:6379/0
+      SCHEDULER_STORAGE_DSN: postgresql://agent:agent@postgres:5432/agent_orchestrator
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.orchestrator.healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 45s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent
+      POSTGRES_DB: agent_orchestrator
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agent_orchestrator"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
