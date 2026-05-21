@@ -7,16 +7,64 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+from src.common.auth import (
+    AuthenticationError,
+    AuthorizationError,
+    auth_service,
+)
+
 logger = logging.getLogger(__name__)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if self._requires_auth(request):
+            try:
+                principal = self._authenticate(request)
+                auth_service.authorize_agent_worker(
+                    principal,
+                    workspace_id=request.headers.get(
+                        "X-Workspace-ID",
+                        "default",
+                    ),
+                    required_scope=self._required_scope(request),
+                )
+                request.state.principal = principal
+            except AuthenticationError:
                 return Response(status_code=401, content="Unauthorized")
+            except AuthorizationError:
+                return Response(status_code=403, content="Forbidden")
         return await call_next(request)
+
+    def _requires_auth(self, request: Request) -> bool:
+        path = request.url.path
+        return (
+            path.startswith("/api/v2")
+            and path != "/api/v2/auth/token"
+            and path.startswith("/api/v2/agents")
+        )
+
+    def _authenticate(self, request: Request):
+        token = request.headers.get("Authorization", "")
+        if token.startswith("Bearer "):
+            return auth_service.authenticate_bearer(token.removeprefix(
+                "Bearer "
+            ))
+
+        session_id = request.cookies.get("ao_session")
+        if session_id:
+            return auth_service.authenticate_session(session_id)
+
+        raise AuthenticationError("Missing credentials")
+
+    def _required_scope(self, request: Request) -> str:
+        if request.method in {"GET", "HEAD", "OPTIONS"}:
+            return "agents:read"
+        return "agents:write"
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -26,14 +74,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +97,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            f"{request.method} {request.url.path} "
+            f"{response.status_code} {duration:.3f}s"
+        )
         return response
 
 # 2019-03-01T18:35:19 update
