@@ -36,6 +36,45 @@ class TestTaskScheduler:
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
 
+    def test_recovery_defers_tasks_over_tenant_concurrency_limit(self):
+        self.scheduler.set_tenant_limit("tenant-a", 1)
+        self.scheduler.enqueue({"type": "running", "tenant_id": "tenant-a"})
+        import asyncio
+        running = asyncio.run(self.scheduler.dequeue())
+
+        result = self.scheduler.recover_after_restart(
+            [
+                {"id": "recover-1", "type": "resume", "tenant_id": "tenant-a", "payload": {"secret": "hidden"}},
+                {"id": "recover-2", "type": "resume", "tenant_id": "tenant-a"},
+            ]
+        )
+
+        assert running["tenant_id"] == "tenant-a"
+        assert result == {"queued": [], "deferred": ["recover-1", "recover-2"]}
+        assert [task["id"] for task in self.scheduler.list_deferred_recovery()] == ["recover-1", "recover-2"]
+        assert all(task["recovery_state"] == "deferred" for task in self.scheduler.list_deferred_recovery())
+        assert "payload" not in self.scheduler.audit_records()[0]
+
+    def test_recovery_admits_only_capacity_per_tenant(self):
+        result = self.scheduler.recover_after_restart(
+            [
+                {"id": "tenant-a-1", "type": "resume", "tenant_id": "tenant-a"},
+                {"id": "tenant-a-2", "type": "resume", "tenant_id": "tenant-a"},
+                {"id": "tenant-b-1", "type": "resume", "tenant_id": "tenant-b"},
+            ],
+            default_tenant_limit=1,
+        )
+
+        assert result == {
+            "queued": ["tenant-a-1", "tenant-b-1"],
+            "deferred": ["tenant-a-2"],
+        }
+        import asyncio
+        first = asyncio.run(self.scheduler.dequeue())
+        second = asyncio.run(self.scheduler.dequeue())
+        assert {first["id"], second["id"]} == {"tenant-a-1", "tenant-b-1"}
+        assert self.scheduler.list_deferred_recovery()[0]["id"] == "tenant-a-2"
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update
