@@ -1,9 +1,10 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Request
 from typing import List, Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.artifact_ingestion import ArtifactIngestionError, artifact_ingestion_service
 
 router = APIRouter()
 registry = AgentRegistry()
@@ -53,6 +54,24 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/workspaces/{workspace_id}/artifacts/{artifact_id}/upload")
+async def upload_artifact(workspace_id: str, artifact_id: str, request: Request):
+    content_length = request.headers.get("content-length")
+    try:
+        artifact_ingestion_service.validate_upload_size(content_length)
+        payload = await request.body()
+        record = artifact_ingestion_service.ingest(workspace_id, artifact_id, payload, content_length)
+    except ArtifactIngestionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+
+    return {
+        "artifact_id": record.artifact_id,
+        "workspace_id": record.workspace_id,
+        "size": record.size,
+        "status": "stored",
+    }
 
 # 2019-03-18T11:10:18 update
 
