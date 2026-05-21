@@ -1,8 +1,14 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 from uuid import uuid4
+
+import yaml
+
+logger = logging.getLogger(__name__)
 
 
 class StepStatus(Enum):
@@ -13,9 +19,20 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class WorkflowDefinitionError(ValueError):
+    """Raised when a workflow definition is unsafe to register."""
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
-        self.id = str(uuid4())
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        step_id: Optional[str] = None,
+    ):
+        self.id = step_id or str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
@@ -35,6 +52,9 @@ class Workflow:
         self.status = StepStatus.PENDING
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        if step.id in self._step_map:
+            logger.warning("Rejected duplicate workflow step id: %s", step.id)
+            raise WorkflowDefinitionError(f"Duplicate workflow step id: {step.id}")
         self.steps.append(step)
         self._step_map[step.id] = step
         return self
@@ -51,6 +71,70 @@ class WorkflowManager:
         workflow = Workflow(name, description)
         self._workflows[workflow.id] = workflow
         return workflow
+
+    def load_workflow_from_yaml(
+        self,
+        path: str,
+        handlers: Optional[Dict[str, Callable]] = None,
+    ) -> Workflow:
+        workflow_path = Path(path)
+        definition = yaml.safe_load(workflow_path.read_text()) or {}
+        return self.register_workflow_definition(definition, handlers, workflow_path.parent)
+
+    def register_workflow_definition(
+        self,
+        definition: Dict[str, Any],
+        handlers: Optional[Dict[str, Callable]] = None,
+        base_path: Optional[Path] = None,
+    ) -> Workflow:
+        nodes = self.validate_workflow_definition(definition, base_path)
+        workflow = Workflow(
+            str(definition.get("name", "workflow")),
+            str(definition.get("description", "")),
+        )
+
+        for node in nodes:
+            node_id = str(node.get("id") or node.get("name"))
+            handler = self._resolve_handler(node, handlers)
+            workflow.add_step(
+                WorkflowStep(
+                    name=str(node.get("name") or node_id),
+                    handler=handler,
+                    retries=int(node.get("retries", 0)),
+                    timeout=int(node.get("timeout", 300)),
+                    step_id=node_id,
+                )
+            )
+
+        self._workflows[workflow.id] = workflow
+        return workflow
+
+    def validate_workflow_definition(
+        self,
+        definition: Dict[str, Any],
+        base_path: Optional[Path] = None,
+    ) -> List[Dict[str, Any]]:
+        nodes = list(self._collect_nodes(definition, base_path, set()))
+        seen: Set[str] = set()
+        workflow_name = str(definition.get("name", "workflow"))
+
+        for node in nodes:
+            node_id = node.get("id") or node.get("name")
+            if not node_id:
+                logger.warning("Rejected workflow definition with unnamed node")
+                raise WorkflowDefinitionError("Workflow node requires an id or name")
+
+            node_id = str(node_id)
+            if node_id in seen:
+                logger.warning(
+                    "Rejected workflow definition %s with duplicate node id: %s",
+                    workflow_name,
+                    node_id,
+                )
+                raise WorkflowDefinitionError(f"Duplicate workflow node id: {node_id}")
+            seen.add(node_id)
+
+        return nodes
 
     def get_workflow(self, workflow_id: str) -> Optional[Workflow]:
         return self._workflows.get(workflow_id)
@@ -81,6 +165,66 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _collect_nodes(
+        self,
+        definition: Dict[str, Any],
+        base_path: Optional[Path],
+        imported_paths: Set[Path],
+    ) -> Iterable[Dict[str, Any]]:
+        if not isinstance(definition, dict):
+            raise WorkflowDefinitionError("Workflow definition must be a mapping")
+
+        imports = definition.get("imports", []) or []
+        if not isinstance(imports, list):
+            raise WorkflowDefinitionError("Workflow imports must be a list")
+
+        for imported in imports:
+            if isinstance(imported, dict):
+                yield from self._collect_nodes(imported, base_path, imported_paths)
+                continue
+
+            if not isinstance(imported, str):
+                raise WorkflowDefinitionError("Workflow import must be a path or mapping")
+
+            import_path = Path(imported)
+            if not import_path.is_absolute() and base_path is not None:
+                import_path = base_path / import_path
+            import_path = import_path.resolve()
+
+            if import_path in imported_paths:
+                logger.warning("Rejected cyclic workflow import: %s", import_path.name)
+                raise WorkflowDefinitionError(f"Cyclic workflow import: {import_path.name}")
+
+            next_paths = set(imported_paths)
+            next_paths.add(import_path)
+            imported_definition = yaml.safe_load(import_path.read_text()) or {}
+            yield from self._collect_nodes(imported_definition, import_path.parent, next_paths)
+
+        nodes = definition.get("nodes", definition.get("steps", [])) or []
+        if not isinstance(nodes, list):
+            raise WorkflowDefinitionError("Workflow nodes must be a list")
+
+        for node in nodes:
+            if not isinstance(node, dict):
+                raise WorkflowDefinitionError("Workflow node must be a mapping")
+            yield node
+
+    def _resolve_handler(
+        self,
+        node: Dict[str, Any],
+        handlers: Optional[Dict[str, Callable]],
+    ) -> Callable:
+        handler_ref = node.get("handler") or node.get("name") or node.get("id")
+        if callable(handler_ref):
+            return handler_ref
+        if handlers and handler_ref in handlers:
+            return handlers[handler_ref]
+        return self._noop_handler
+
+    @staticmethod
+    def _noop_handler() -> None:
+        return None
 
 # 2019-03-27T19:58:07 update
 
