@@ -4,8 +4,9 @@ import os
 import signal
 import subprocess
 import logging
+import threading
 from enum import Enum
-from typing import Dict, Optional
+from typing import BinaryIO, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,16 @@ class AgentRuntime:
     def __init__(self):
         self._processes: Dict[str, subprocess.Popen] = {}
         self._states: Dict[str, RuntimeState] = {}
+        self._drainers: Dict[str, list[threading.Thread]] = {}
+
+    @staticmethod
+    def _drain_stream(stream: Optional[BinaryIO], agent_id: str, stream_name: str) -> None:
+        if stream is None:
+            return
+        for line in iter(lambda: stream.readline(), b""):
+            decoded = line.decode("utf-8", errors="replace").rstrip()
+            if decoded:
+                logger.debug("Agent %s %s: %s", agent_id, stream_name, decoded)
 
     def start(self, agent_id: str, command: list, env: Optional[Dict] = None) -> bool:
         if agent_id in self._processes and self._processes[agent_id].poll() is None:
@@ -42,6 +53,20 @@ class AgentRuntime:
                 stderr=subprocess.PIPE,
             )
             self._processes[agent_id] = proc
+            self._drainers[agent_id] = [
+                threading.Thread(
+                    target=self._drain_stream,
+                    args=(proc.stdout, agent_id, "stdout"),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=self._drain_stream,
+                    args=(proc.stderr, agent_id, "stderr"),
+                    daemon=True,
+                ),
+            ]
+            for thread in self._drainers[agent_id]:
+                thread.start()
             self._states[agent_id] = RuntimeState.RUNNING
             logger.info(f"Agent {agent_id} started (PID: {proc.pid})")
             return True
@@ -62,6 +87,9 @@ class AgentRuntime:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+
+        for thread in self._drainers.pop(agent_id, []):
+            thread.join(timeout=1)
 
         self._states[agent_id] = RuntimeState.STOPPED
         logger.info(f"Agent {agent_id} stopped")
