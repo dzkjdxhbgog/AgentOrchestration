@@ -23,6 +23,12 @@ jobs:
         uses: astral-sh/setup-uv@v3
       - name: Install dependencies
         run: uv sync
+      - name: Verify generated dependency manifests
+        run: |
+          if ! uv lock --check; then
+            echo "Dependency manifests are stale. Run `uv lock` and commit updated lockfiles."
+            exit 1
+          fi
       - name: Run tests
         run: uv run pytest --cov=src tests/
       - name: Lint

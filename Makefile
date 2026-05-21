@@ -3,6 +3,10 @@
 install:
 	uv sync
 
+check-manifests:
+	@echo "Checking generated dependency manifests..."
+	@uv lock --check || (echo "Dependency manifests are stale. Run `uv lock` and commit updated lockfiles." && exit 1)
+
 test:
 	pytest --cov=src tests/ -v
 
