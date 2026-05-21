@@ -1,8 +1,12 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import hashlib
+import inspect
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+from src.common.metrics import metrics
 
 
 class StepStatus(Enum):
@@ -13,13 +17,31 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class BranchOutputNamespaceError(ValueError):
+    pass
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        branch_id: Optional[str] = None,
+        output_namespace: Optional[str] = None,
+        join_id: Optional[str] = None,
+        join_sources: Optional[List[str]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.branch_id = branch_id
+        self.output_namespace = output_namespace
+        self.join_id = join_id
+        self.join_sources = join_sources or []
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
@@ -33,14 +55,157 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.outputs: Dict[str, Any] = {}
+        self.audit_records: List[Dict[str, Any]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        self._validate_new_step(step)
         self.steps.append(step)
         self._step_map[step.id] = step
         return self
 
+    def add_branch_step(
+        self,
+        name: str,
+        handler: Callable,
+        branch_id: str,
+        output_namespace: str,
+        join_id: str,
+        retries: int = 0,
+        timeout: int = 300,
+    ) -> "Workflow":
+        return self.add_step(
+            WorkflowStep(
+                name,
+                handler,
+                retries=retries,
+                timeout=timeout,
+                branch_id=branch_id,
+                output_namespace=output_namespace,
+                join_id=join_id,
+            )
+        )
+
+    def add_join_step(
+        self,
+        name: str,
+        handler: Callable,
+        join_id: str,
+        branch_ids: List[str],
+        retries: int = 0,
+        timeout: int = 300,
+    ) -> "Workflow":
+        return self.add_step(
+            WorkflowStep(
+                name,
+                handler,
+                retries=retries,
+                timeout=timeout,
+                join_id=join_id,
+                join_sources=branch_ids,
+            )
+        )
+
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
+
+    def validate_graph(self) -> bool:
+        branch_groups: Dict[str, List[WorkflowStep]] = {}
+        branch_ids: Dict[str, WorkflowStep] = {}
+        joins: Dict[str, List[WorkflowStep]] = {}
+
+        for step in self.steps:
+            if step.branch_id or step.output_namespace:
+                if not self._is_valid_branch_step(step):
+                    self._record_audit("reject", "missing_branch_namespace_metadata", step)
+                    return False
+                step.output_namespace = self._normalize_namespace(step.output_namespace)
+                branch_groups.setdefault(step.join_id, []).append(step)
+                branch_ids[step.branch_id] = step
+            if step.join_sources:
+                joins.setdefault(step.join_id, []).append(step)
+
+        for join_id, branch_steps in branch_groups.items():
+            for index, left in enumerate(branch_steps):
+                for right in branch_steps[index + 1:]:
+                    if self._namespaces_conflict(left.output_namespace, right.output_namespace):
+                        self._record_audit("reject", "branch_namespace_collision", left, join_id)
+                        return False
+            if join_id not in joins:
+                self._record_audit("reject", "missing_join_for_branch_outputs", branch_steps[0], join_id)
+                return False
+
+        for join_id, join_steps in joins.items():
+            for step in join_steps:
+                if not join_id or not step.join_sources:
+                    self._record_audit("reject", "invalid_join_binding", step, join_id)
+                    return False
+                for branch_id in step.join_sources:
+                    branch = branch_ids.get(branch_id)
+                    if not branch or branch.join_id != join_id:
+                        self._record_audit("reject", "unknown_join_branch", step, join_id)
+                        return False
+        return True
+
+    def _validate_new_step(self, step: WorkflowStep) -> None:
+        if not (step.branch_id or step.output_namespace):
+            return
+        if not self._is_valid_branch_step(step):
+            raise BranchOutputNamespaceError("branch output steps require branch_id, join_id, and output_namespace")
+
+        step.output_namespace = self._normalize_namespace(step.output_namespace)
+        for existing in self.steps:
+            if existing.join_id != step.join_id or not existing.output_namespace:
+                continue
+            existing_namespace = self._normalize_namespace(existing.output_namespace)
+            if self._namespaces_conflict(existing_namespace, step.output_namespace):
+                raise BranchOutputNamespaceError(
+                    f"branch output namespace collision for join '{step.join_id}'"
+                )
+
+    def _is_valid_branch_step(self, step: WorkflowStep) -> bool:
+        return bool(step.branch_id and step.join_id and step.output_namespace)
+
+    def _normalize_namespace(self, namespace: Optional[str]) -> str:
+        if not isinstance(namespace, str):
+            raise BranchOutputNamespaceError("output namespace must be a string")
+        normalized = ".".join(part.strip() for part in namespace.strip().split(".") if part.strip())
+        if not normalized:
+            raise BranchOutputNamespaceError("output namespace cannot be empty")
+        return normalized
+
+    def _namespaces_conflict(self, left: str, right: str) -> bool:
+        return left == right or left.startswith(f"{right}.") or right.startswith(f"{left}.")
+
+    def _record_audit(
+        self,
+        decision: str,
+        reason: str,
+        step: Optional[WorkflowStep] = None,
+        join_id: Optional[str] = None,
+    ) -> None:
+        metrics.increment(f"workflow.branch_outputs.{decision}.{reason}")
+        self.audit_records.append(
+            {
+                "decision": decision,
+                "reason": reason,
+                "workflow_ref": self._safe_ref(self.id),
+                "step_ref": self._safe_ref(step.id) if step else None,
+                "join_ref": self._safe_ref(join_id or getattr(step, "join_id", None)),
+                "namespace_ref": self._safe_ref(getattr(step, "output_namespace", None)),
+            }
+        )
+
+    def _safe_ref(self, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
+
+    def _branch_namespace(self, branch_id: str) -> Optional[str]:
+        for step in self.steps:
+            if step.branch_id == branch_id:
+                return step.output_namespace
+        return None
 
 
 class WorkflowManager:
@@ -66,12 +231,21 @@ class WorkflowManager:
         if not workflow:
             return False
 
+        if not workflow.validate_graph():
+            workflow.status = StepStatus.FAILED
+            return False
+
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
             try:
-                result = step.handler()
+                if step.join_sources:
+                    result = self._run_join_step(workflow, step)
+                else:
+                    result = step.handler()
                 step.result = result
+                if step.output_namespace:
+                    workflow.outputs[step.output_namespace] = result
                 step.status = StepStatus.COMPLETED
             except Exception as e:
                 step.error = str(e)
@@ -81,6 +255,30 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _run_join_step(self, workflow: Workflow, step: WorkflowStep) -> Any:
+        branch_outputs = {}
+        for branch_id in step.join_sources:
+            namespace = workflow._branch_namespace(branch_id)
+            if namespace in workflow.outputs:
+                branch_outputs[namespace] = workflow.outputs[namespace]
+
+        try:
+            signature = inspect.signature(step.handler)
+        except (TypeError, ValueError):
+            return step.handler(branch_outputs)
+
+        accepts_payload = any(
+            parameter.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.VAR_POSITIONAL,
+            )
+            for parameter in signature.parameters.values()
+        )
+        if accepts_payload:
+            return step.handler(branch_outputs)
+        return step.handler()
 
 # 2019-03-27T19:58:07 update
 
