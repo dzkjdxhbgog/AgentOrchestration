@@ -2,12 +2,24 @@
 
 import argparse
 import sys
+from typing import Optional, Sequence
 
 from src.common.config import Config
 from src.common.logging import configure_logging
 
+MAX_LOG_TAIL_LINES = 1000
+MIN_LOG_TAIL_LINES = 1
 
-def cli():
+
+def _validate_log_tail(tail: int) -> int:
+    if tail < MIN_LOG_TAIL_LINES:
+        raise ValueError(f"--tail must be at least {MIN_LOG_TAIL_LINES}")
+    if tail > MAX_LOG_TAIL_LINES:
+        raise ValueError(f"--tail must be at most {MAX_LOG_TAIL_LINES} lines")
+    return tail
+
+
+def cli(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser(description="Agent Orchestrator CLI")
     parser.add_argument("--config", "-c", help="Path to config file")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
@@ -25,14 +37,26 @@ def cli():
 
     logs_parser = subparsers.add_parser("logs", help="View agent logs")
     logs_parser.add_argument("agent_id", help="Agent ID")
-    logs_parser.add_argument("--tail", "-t", type=int, default=50, help="Number of lines")
+    logs_parser.add_argument(
+        "--tail",
+        "-t",
+        type=int,
+        default=50,
+        help=f"Number of lines to fetch, from {MIN_LOG_TAIL_LINES} to {MAX_LOG_TAIL_LINES}",
+    )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.verbose:
         configure_logging("DEBUG")
     else:
         configure_logging("INFO")
+
+    if args.command == "logs":
+        try:
+            _validate_log_tail(args.tail)
+        except ValueError as exc:
+            logs_parser.error(str(exc))
 
     if args.command == "init":
         print(f"Initializing project: {args.name}")
