@@ -1,8 +1,28 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+from src.common.metrics import metrics
+
+logger = logging.getLogger(__name__)
+
+RESERVED_METADATA_KEYS = {
+    "id",
+    "workflow_id",
+    "step_id",
+    "status",
+    "state",
+    "lifecycle",
+    "created_at",
+    "updated_at",
+    "run_id",
+    "attempt",
+    "handler",
+    "queue",
+}
 
 
 class StepStatus(Enum):
@@ -14,27 +34,60 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.metadata = metadata or {}
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
 
 
 class Workflow:
-    def __init__(self, name: str, description: str = ""):
+    def __init__(
+        self,
+        name: str,
+        description: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.description = description
+        self.metadata = metadata or {}
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.audit_records: List[Dict[str, Any]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        invalid_keys = find_reserved_metadata_keys(step.metadata)
+        if invalid_keys:
+            self.audit_records.append(
+                {
+                    "event": "workflow.step_metadata_rejected",
+                    "workflow_id": self.id,
+                    "step_id": step.id,
+                    "invalid_keys": invalid_keys,
+                }
+            )
+            logger.warning(
+                "Rejected workflow step metadata with reserved keys",
+                extra={"workflow_id": self.id, "step_id": step.id},
+            )
+            metrics.increment("workflow.metadata_rejected")
+            keys = ", ".join(invalid_keys)
+            raise ValueError(f"Reserved metadata keys are not allowed: {keys}")
+
         self.steps.append(step)
         self._step_map[step.id] = step
         return self
@@ -46,9 +99,35 @@ class Workflow:
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self.audit_records: List[Dict[str, Any]] = []
 
-    def create_workflow(self, name: str, description: str = "") -> Workflow:
-        workflow = Workflow(name, description)
+    def create_workflow(
+        self,
+        name: str,
+        description: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Workflow:
+        invalid_keys = find_reserved_metadata_keys(metadata or {})
+        if invalid_keys:
+            record = {
+                "event": "workflow.metadata_rejected",
+                "workflow_name": name,
+                "invalid_keys": invalid_keys,
+            }
+            self.audit_records.append(record)
+            logger.warning(
+                "Rejected workflow metadata with reserved keys",
+                extra={"workflow_name": name},
+            )
+            metrics.increment("workflow.metadata_rejected")
+            keys = ", ".join(invalid_keys)
+            raise ValueError(f"Reserved metadata keys are not allowed: {keys}")
+
+        workflow = Workflow(
+            name,
+            description,
+            metadata,
+        )
         self._workflows[workflow.id] = workflow
         return workflow
 
@@ -66,6 +145,23 @@ class WorkflowManager:
         if not workflow:
             return False
 
+        invalid_keys = find_workflow_reserved_metadata_keys(workflow)
+        if invalid_keys:
+            workflow.audit_records.append(
+                {
+                    "event": "workflow.execution_deferred",
+                    "workflow_id": workflow.id,
+                    "invalid_keys": invalid_keys,
+                    "status": workflow.status.value,
+                }
+            )
+            logger.warning(
+                "Deferred workflow execution because metadata uses "
+                "reserved keys",
+            )
+            metrics.increment("workflow.execution_deferred")
+            return False
+
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
@@ -81,6 +177,25 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+
+def find_reserved_metadata_keys(metadata: Dict[str, Any]) -> List[str]:
+    return sorted(
+        key for key in metadata if key.lower() in RESERVED_METADATA_KEYS
+    )
+
+
+def find_workflow_reserved_metadata_keys(workflow: Workflow) -> List[str]:
+    invalid = {
+        f"workflow.{key}"
+        for key in find_reserved_metadata_keys(workflow.metadata)
+    }
+    for step in workflow.steps:
+        invalid.update(
+            f"step.{step.id}.{key}"
+            for key in find_reserved_metadata_keys(step.metadata)
+        )
+    return sorted(invalid)
 
 # 2019-03-27T19:58:07 update
 
