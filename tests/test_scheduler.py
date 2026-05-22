@@ -36,6 +36,95 @@ class TestTaskScheduler:
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
 
+    def test_batch_ack_requires_owner(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+
+        result = self.scheduler.acknowledge_batch("worker-b", [task["id"]])
+
+        assert not result["ok"]
+        assert result["errors"][0]["reason"] == "wrong_worker"
+        assert self.scheduler.complete(task_id)
+
+    def test_batch_ack_completes_owned_tasks_idempotently(self):
+        first_id = self.scheduler.enqueue({"type": "first"})
+        second_id = self.scheduler.enqueue({"type": "second"})
+        import asyncio
+        first = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+        second = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+
+        result = self.scheduler.acknowledge_batch(
+            "worker-a",
+            [
+                {"task_id": first["id"], "claim_id": first["claim_id"]},
+                {"task_id": second["id"], "claim_id": second["claim_id"]},
+            ],
+        )
+        retry = self.scheduler.acknowledge_batch(
+            "worker-a",
+            [
+                {"task_id": first_id, "claim_id": first["claim_id"]},
+                {"task_id": second_id, "claim_id": second["claim_id"]},
+            ],
+        )
+
+        assert result["ok"]
+        assert result["acked"] == [first_id, second_id]
+        assert retry["ok"]
+        assert retry["acked"] == []
+        assert retry["idempotent"] == [first_id, second_id]
+        assert not self.scheduler.complete(first_id)
+        assert not self.scheduler.complete(second_id)
+
+    def test_batch_ack_retry_without_claim_id_is_idempotent(self):
+        task_id = self.scheduler.enqueue({"type": "first"})
+        import asyncio
+        asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+
+        result = self.scheduler.acknowledge_batch("worker-a", [task_id])
+        retry = self.scheduler.acknowledge_batch("worker-a", [task_id])
+
+        assert result["ok"]
+        assert retry["ok"]
+        assert retry["idempotent"] == [task_id]
+
+    def test_batch_ack_rejects_atomically_when_one_task_is_not_owned(self):
+        owned_id = self.scheduler.enqueue({"type": "owned"})
+        other_id = self.scheduler.enqueue({"type": "other"})
+        import asyncio
+        owned = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+        other = asyncio.run(self.scheduler.dequeue(worker_id="worker-b"))
+
+        result = self.scheduler.acknowledge_batch(
+            "worker-a",
+            [
+                {"task_id": owned["id"], "claim_id": owned["claim_id"]},
+                {"task_id": other["id"], "claim_id": other["claim_id"]},
+            ],
+        )
+
+        assert not result["ok"]
+        assert result["errors"][0]["task_id"] == other_id
+        assert self.scheduler.complete(owned_id)
+        assert self.scheduler.complete(other_id)
+
+    def test_batch_fail_ack_retry_is_idempotent(self):
+        task_id = self.scheduler.enqueue({"type": "retry"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+        ack = [{"task_id": task_id, "claim_id": task["claim_id"]}]
+
+        result = self.scheduler.acknowledge_batch("worker-a", ack, action="fail")
+        retry = self.scheduler.acknowledge_batch("worker-a", ack, action="fail")
+
+        assert result["ok"]
+        assert len(result["retried"]) == 1
+        assert retry["ok"]
+        assert retry["retried"] == []
+        assert retry["idempotent"] == [task_id]
+        assert self.scheduler._queues["default"].__len__() == 1
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update

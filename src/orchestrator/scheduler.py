@@ -3,7 +3,7 @@
 import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 from uuid import uuid4
 
 
@@ -35,6 +35,7 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._acknowledged: Dict[Tuple[str, Optional[str], str], Dict] = {}
         self._max_retries = 3
 
     def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
@@ -42,6 +43,11 @@ class TaskScheduler:
         task["id"] = task_id
         task["enqueued_at"] = time.time()
         task["retries"] = 0
+        task["queue"] = queue
+        task["priority"] = priority
+        task.pop("claimed_by", None)
+        task.pop("claimed_at", None)
+        task.pop("claim_id", None)
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
@@ -54,7 +60,12 @@ class TaskScheduler:
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+        worker_id: Optional[str] = None,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -65,6 +76,10 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                task["queue"] = queue
+                task["claimed_by"] = worker_id
+                task["claimed_at"] = time.time()
+                task["claim_id"] = str(uuid4())
                 self._in_flight[task["id"]] = task
                 return task
         return None
@@ -80,6 +95,128 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def acknowledge_batch(
+        self,
+        worker_id: str,
+        acknowledgements: Iterable[Union[str, Dict[str, str]]],
+        action: str = "complete",
+        queue: str = "default",
+    ) -> Dict[str, Any]:
+        if not worker_id:
+            return self._ack_result(False, errors=[{"reason": "missing_worker_id"}])
+        if action not in {"complete", "fail"}:
+            return self._ack_result(False, errors=[{"reason": "invalid_action", "action": action}])
+
+        normalized = self._normalize_acknowledgements(acknowledgements)
+        errors: List[Dict[str, Any]] = []
+        seen = set()
+        to_commit = []
+        idempotent = []
+
+        for task_id, claim_id in normalized:
+            current = self._in_flight.get(task_id)
+            effective_claim_id = claim_id or (current or {}).get("claim_id")
+            ack_key = (task_id, effective_claim_id, action)
+
+            if ack_key in seen:
+                errors.append({"task_id": task_id, "reason": "duplicate_in_batch"})
+                continue
+            seen.add(ack_key)
+
+            previous = self._acknowledged.get(ack_key)
+            if previous:
+                if previous["worker_id"] == worker_id:
+                    idempotent.append(task_id)
+                    continue
+                errors.append({"task_id": task_id, "reason": "acknowledged_by_other_worker"})
+                continue
+
+            if not current:
+                previous = self._find_acknowledgement(task_id, claim_id, action)
+                if previous:
+                    if previous["worker_id"] == worker_id:
+                        idempotent.append(task_id)
+                        continue
+                    errors.append({"task_id": task_id, "reason": "acknowledged_by_other_worker"})
+                    continue
+                errors.append({"task_id": task_id, "reason": "not_in_flight"})
+                continue
+            if current.get("claimed_by") != worker_id:
+                errors.append({"task_id": task_id, "reason": "wrong_worker"})
+                continue
+            if claim_id is not None and current.get("claim_id") != claim_id:
+                errors.append({"task_id": task_id, "reason": "stale_claim"})
+                continue
+
+            to_commit.append((task_id, current, ack_key))
+
+        if errors:
+            return self._ack_result(False, idempotent=idempotent, errors=errors)
+
+        acked = []
+        retried = []
+        for task_id, task, ack_key in to_commit:
+            self._in_flight.pop(task_id, None)
+            self._acknowledged[ack_key] = {
+                "worker_id": worker_id,
+                "action": action,
+                "acknowledged_at": time.time(),
+            }
+            acked.append(task_id)
+
+            if action == "fail":
+                task["retries"] += 1
+                if task["retries"] < self._max_retries:
+                    retry_id = self.enqueue(dict(task), queue, priority=task.get("priority", 0))
+                    retried.append(retry_id)
+
+        return self._ack_result(True, acked=acked, idempotent=idempotent, retried=retried)
+
+    def _normalize_acknowledgements(
+        self,
+        acknowledgements: Iterable[Union[str, Dict[str, str]]],
+    ) -> List[Tuple[str, Optional[str]]]:
+        normalized = []
+        for ack in acknowledgements:
+            if isinstance(ack, dict):
+                task_id = ack.get("task_id") or ack.get("id")
+                claim_id = ack.get("claim_id")
+            else:
+                task_id = str(ack)
+                claim_id = None
+            normalized.append((task_id, claim_id))
+        return normalized
+
+    def _find_acknowledgement(
+        self,
+        task_id: str,
+        claim_id: Optional[str],
+        action: str,
+    ) -> Optional[Dict]:
+        if claim_id is not None:
+            return self._acknowledged.get((task_id, claim_id, action))
+
+        for (acked_task_id, _acked_claim_id, acked_action), record in self._acknowledged.items():
+            if acked_task_id == task_id and acked_action == action:
+                return record
+        return None
+
+    def _ack_result(
+        self,
+        ok: bool,
+        acked: Optional[List[str]] = None,
+        idempotent: Optional[List[str]] = None,
+        retried: Optional[List[str]] = None,
+        errors: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "ok": ok,
+            "acked": acked or [],
+            "idempotent": idempotent or [],
+            "retried": retried or [],
+            "errors": errors or [],
+        }
 
 # 2019-04-25T08:37:12 update
 
