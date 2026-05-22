@@ -116,3 +116,28 @@ exceptions:
         "pypi:other-package@1.0.0: override has no active matching "
         "manifest entry"
     ]
+
+
+def test_duplicate_exception_ids_are_rejected(tmp_path):
+    manifest = write_manifest(
+        tmp_path,
+        """
+exceptions:
+  - id: GHSA-dup
+    ecosystem: pypi
+    name: demo-package
+    version: "1.2.3"
+    owner: "@platform-security"
+    reason: "Needs temporary exception."
+    expires_on: "2026-06-30"
+  - id: GHSA-dup
+    coordinate: npm:left-pad@1.0.0
+    owner: "@platform-security"
+    reason: "Second duplicate entry."
+    expires_on: "2026-06-30"
+""",
+    )
+
+    assert validate_manifest(manifest, today=date(2026, 5, 22)) == [
+        "GHSA-dup: id must be unique"
+    ]
